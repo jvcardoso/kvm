@@ -441,3 +441,44 @@ func TestNativeActionIncludesBlockedWriteAndReleasesConnection(t *testing.T) {
 		t.Fatalf("connection did not recover after timeout: %v", err)
 	}
 }
+
+func TestGithubUpstreamSystemReleaseIsolation(t *testing.T) {
+	forkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":    "9.9.9-fork",
+			"zipball_url": "https://example.invalid/fork-system.zip",
+		})
+	}))
+	defer forkServer.Close()
+
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tag_name":    "0.1.9",
+			"zipball_url": "https://example.invalid/upstream-system.zip",
+		})
+	}))
+	defer upstreamServer.Close()
+
+	origForkURLs := UpdateGithubSystemReleaseUrls
+	origUpstreamURLs := UpdateGithubUpstreamSystemReleaseUrls
+	origSource := updateSource
+	t.Cleanup(func() {
+		UpdateGithubSystemReleaseUrls = origForkURLs
+		UpdateGithubUpstreamSystemReleaseUrls = origUpstreamURLs
+		updateSource = origSource
+	})
+
+	UpdateGithubSystemReleaseUrls = []string{forkServer.URL, upstreamServer.URL}
+	UpdateGithubUpstreamSystemReleaseUrls = []string{upstreamServer.URL}
+
+	if err := rpcSetUpdateSource(updateSourceGithubUpstream); err != nil {
+		t.Fatalf("rpcSetUpdateSource(github_upstream) failed: %v", err)
+	}
+	tag, zipURL, _, _, err := fetchKvmSystemLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("fetchKvmSystemLatestRelease failed: %v", err)
+	}
+	if tag != "0.1.9" || zipURL != "https://example.invalid/upstream-system.zip" {
+		t.Fatalf("expected upstream system release 0.1.9, got tag=%q url=%q", tag, zipURL)
+	}
+}

@@ -454,7 +454,14 @@ func writeRawConfig(path string, raw json.RawMessage) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Rename(file.Name(), path)
+	if err := os.Rename(file.Name(), path); err != nil {
+		return err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return nil
 }
 
 func parseConfigObject(raw []byte) (map[string]json.RawMessage, error) {

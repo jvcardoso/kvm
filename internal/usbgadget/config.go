@@ -314,18 +314,17 @@ func (u *UsbGadget) ensureGadgetUnbound() error {
 		Msg("unbinding existing UDC before reconfiguration")
 
 	if err := u.UnbindUDC(); err != nil {
-		u.log.Warn().Err(err).Msg("failed to unbind via UDC file, trying DWC3")
-		if err := u.UnbindUDCToDWC3(); err != nil {
-			return fmt.Errorf("failed to unbind UDC: %w", err)
-		}
+		return fmt.Errorf("failed to unbind UDC: %w", err)
 	}
 
 	time.Sleep(200 * time.Millisecond)
 
-	if content, err := os.ReadFile(udcPath); err == nil {
-		if trimmed := strings.TrimSpace(string(content)); trimmed != "" && trimmed != "none" {
-			u.log.Warn().Msg("UDC still bound after unbind attempt")
-		}
+	content, err := os.ReadFile(udcPath)
+	if err != nil {
+		return fmt.Errorf("failed to re-read UDC file after unbind: %w", err)
+	}
+	if trimmed := strings.TrimSpace(string(content)); trimmed != "" && trimmed != "none" {
+		return fmt.Errorf("UDC still bound after unbind attempt: %s", trimmed)
 	}
 
 	return nil
@@ -352,10 +351,9 @@ func (u *UsbGadget) configureUsbGadget(resetUsb bool) error {
 
 	return u.withHIDRebind(func() error {
 		if err := u.ensureGadgetUnbound(); err != nil {
-			u.log.Warn().Err(err).Msg("failed to ensure gadget is unbound, will continue")
-		} else {
-			u.log.Info().Msg("gadget unbind check completed")
+			return fmt.Errorf("failed to ensure gadget is unbound: %w", err)
 		}
+		u.log.Info().Msg("gadget unbind check completed")
 
 		return u.WithTransaction(func() error {
 			u.log.Info().Msg("Transaction: Mounting configfs")

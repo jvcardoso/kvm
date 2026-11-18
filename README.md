@@ -23,7 +23,9 @@ Luckfox PicoKVM é uma ferramenta leve de operação e manutenção IP KVM basea
 
 ## Melhorias Implementadas sobre o Projeto Original
 
-Esta versão (`AppVersion: 0.1.6` / `SystemVersion: 0.1.9`) inclui um conjunto abrangente de correções de segurança, estabilidade, concorrência, USB ConfigFS, mídia virtual, internacionalização (`pt-BR` / ABNT2), usabilidade móvel e suporte a múltiplos repositórios OTA.
+Esta versão do aplicativo (`AppVersion: 0.1.6`, testada sobre a imagem base `SystemVersion: 0.1.9` do dispositivo) inclui um conjunto de correções de segurança, estabilidade, concorrência, USB ConfigFS, mídia virtual, internacionalização (`pt-BR` / ABNT2), usabilidade móvel e seleção entre dois repositórios GitHub para atualização OTA do aplicativo.
+
+> **Nota sobre o pacote `0.1.6`:** a release `0.1.6` e o pacote `picokvm_local_update_0.1.6.zip` contêm `version.txt`, `kvm_app` e `kvm_app.sha256` (`HasSystem=false`, sem `update_system.zip`). Eles atualizam **somente o aplicativo (`kvm_app` para `0.1.6`)**; o campo `SystemVersion: 0.1.9` no manifesto indica a versão do sistema base em execução no equipamento validado, não realizando atualização da imagem de sistema operacional.
 
 ### 1. Segurança, Autenticação e Controle de Acesso
 * **Proteção de endpoints administrativos e CORS**:
@@ -40,11 +42,12 @@ Esta versão (`AppVersion: 0.1.6` / `SystemVersion: 0.1.9`) inclui um conjunto a
   * Bind padrão restrito a `127.0.0.1` quando nenhum token é definido e exigência de autenticação Bearer constante (`subtle.ConstantTimeCompare`) quando exposto na rede.
 
 ### 2. Estabilidade, Concorrência e Persistência (Backend Go)
-* **Gravação atômica e resiliente de configuração (`config.go`)**:
-  * Escrita via arquivo temporário no mesmo diretório seguida de `Sync()`, `Close()` e `os.Rename()` atômico, preservando um backup `.bak` válido e evitando corrupção de `/userdata/kvm_config.json` em quedas de energia.
-  * Migração segura de configurações legadas ou nulas sem sobrescrever credenciais nem quebrar quando o cartão SD não está presente.
-* **Sincronização de sessões WebRTC e timers (`webrtc.go`, `main.go`, `timesync.go`)**:
-  * Proteção concorrente de `currentSession` com mutex dedicado e troca atômica de sessão ao desconectar ou substituir clientes.
+* **Gravação atômica de configuração e preservação de arquivos corrompidos (`config.go`)**:
+  * Escrita via arquivo temporário no mesmo diretório seguida de `Sync()`, `Close()`, `os.Rename()` atômico e `Sync()` do diretório pai para reduzir o risco de truncamento em reinicializações abruptas.
+  * Caso um arquivo `/userdata/kvm_config.json` inválido ou corrompido seja encontrado na leitura, ele é preservado com sufixo `.corrupt.<timestamp>` para diagnóstico antes de aplicar a configuração padrão (não é mantido um backup rotativo `.bak`).
+  * Migração segura de configurações legadas ou nulas sem sobrescrever credenciais nem falhar quando o cartão SD não está presente.
+* **Sincronização de sessões WebRTC e timers (`web.go`, `webrtc.go`, `main.go`, `timesync.go`)**:
+  * Gerenciamento concorrente de `currentSession` com `atomic.Pointer[Session]` (troca e comparação atômica `CompareAndSwap`/`Swap` ao desconectar ou substituir clientes).
   * Uso de `atomic.Bool` no estado de sincronização NTP (`timeSyncDone`) e limpeza de goroutines órfãs no coletor de estatísticas de rede.
 * **Prevenção de deadlocks e corridas em JSON-RPC e OTA (`jsonrpc.go`, `ota.go`)**:
   * Liberação de locks de configuração antes de chamadas de subsistema (display, USB, áudio, rede) e serialização completa do fluxo de atualização OTA com verificação de hash SHA-256 antes da substituição do binário.
@@ -54,41 +57,45 @@ Esta versão (`AppVersion: 0.1.6` / `SystemVersion: 0.1.9`) inclui um conjunto a
   * Troca atômica de diretórios (`RENAME_EXCHANGE` no Linux) durante a instalação/atualização de binários de VPN (Tailscale, ZeroTier, EasyTier, WireGuard) com rollback automático em caso de falha.
 
 ### 3. USB Gadget e Recuperação HID (`internal/usbgadget`)
-* **Correção do erro `failed to start kvm: -19` (`-ENODEV`) no controlador DWC3**:
-  * O controlador USB do RK3506/RV1106 possui limite de endpoints de hardware. Quando `Audio` (`uac1.usb0`) ou `MTP` está habilitado, a função extra `hid.usb3` (pen/touchscreen) agora é automaticamente desabilitada em `HasPenTouch()`, garantindo que teclado (`hid.usb0`), mouse absoluto (`hid.usb1`), mouse relativo (`hid.usb2`) e áudio/mass-storage subam simultaneamente sem exaurir endpoints.
-* **Rebind limpo do ConfigFS**:
-  * `configureUsbGadget()` executa `ensureGadgetUnbound()` dentro do ciclo `withHIDRebind`, fechando descritores `/dev/hidg*` abertos antes de alterar symlinks do ConfigFS e religando o UDC (`ffb00000.usb`) de forma determinística.
+* **Mitigação do erro `failed to start kvm: -19` (`-ENODEV`) no controlador DWC3**:
+  * O controlador USB do RK3506/RV1106 possui limite de endpoints de hardware. Quando `Audio` (`uac1.usb0`) ou `MTP` está habilitado, a função extra `hid.usb3` (pen/touchscreen) é automaticamente desabilitada em `HasPenTouch()`, permitindo que teclado (`hid.usb0`), mouse absoluto (`hid.usb1`), mouse relativo (`hid.usb2`) e áudio/mass-storage subam simultaneamente na combinação validada sem exaurir endpoints.
+* **Verificação de unbind no rebind do ConfigFS**:
+  * `configureUsbGadget()` executa `ensureGadgetUnbound()` dentro do ciclo `withHIDRebind`, fechando descritores `/dev/hidg*` abertos, desvinculando o `UDC` (`ffb00000.usb`) e interrompendo a reconfiguração caso o `UDC` permaneça vinculado após a tentativa de unbind (sem forçar o unbind do driver DWC3 da plataforma durante atualizações de configuração).
 
 ### 4. Mídia Virtual: NBD, WebRTC Disk e HTTP Range (`remote_mount.go`, `block_device.go`, `fuse.go`)
 * **Montagem remota via WebRTC e HTTP**:
   * Implementação do hook `useWebRTCDisk` no frontend e validação de limites de offset/tamanho no canal `disk` do backend.
-  * Suporte completo ao ciclo `mountWithHTTP` com verificação `HEAD`/Range, cache em memória com substituição de blocos (evitando crescimento ilimitado de RAM) e desmontagem limpa antes de trocar de mídia.
+  * Suporte ao ciclo `mountWithHTTP` com verificação `HEAD`/Range, cache em memória com substituição de blocos (evitando crescimento ilimitado de RAM) e desmontagem limpa antes de trocar de mídia.
 * **Dispositivo NBD resiliente**:
   * Abertura do `/dev/nbd0` com `O_RDWR`, desconexão explícita (`NBD_CLEAR_SOCK` / `NBD_DISCONNECT`) no encerramento e espera ativa pela prontidão do bloco antes de vinculá-lo ao gadget USB Mass Storage.
 
 ### 5. Internacionalização (`pt-BR`) e Teclado Brasileiro ABNT2
-* **Tradução completa para Português do Brasil ([pt.json](./ui/src/locales/pt.json))**:
-  * Interface inteiramente traduzida para `pt-BR` (menus, configurações, energia/ATX, mídia virtual, rede, VPN, áudio, vídeo, terminal, diagnóstico e instruções de gestos).
+* **Dicionário completo em Português do Brasil ([pt.json](./ui/src/locales/pt.json))**:
+  * Paridade completa de chaves com o dicionário inglês (`en.json`) cobrindo menus, configurações, energia/ATX, mídia virtual, rede, VPN, áudio, vídeo, terminal, diagnóstico, instruções de gestos e notificações de teclado/colagem (algumas notificações programáticas de erro em outros módulos do frontend ainda emitem strings literais em inglês).
 * **Layout de teclado ABNT2 (`pt_BR`) ([pt_BR.ts](./ui/src/keyboardLayouts/pt_BR.ts))**:
-  * Mapeamento HID completo para o padrão brasileiro ABNT2, incluindo `ç`/`Ç` (`Semicolon`), barra/interrogação (`IntlRo` e `AltGr+Q`/`AltGr+W`), barra invertida/pipe (`IntlBackslash`), acentos/dead keys (`´`, `` ` ``, `~`, `^`, `¨`) e combinações com `AltGr`.
+  * Mapeamento para o padrão brasileiro ABNT2, incluindo `ç`/`Ç` (`Semicolon`), barra invertida/pipe (`IntlBackslash`), acentos/dead keys (`´`, `` ` ``, `~`, `^`, `¨`) e combinações com `AltGr` (como `AltGr+Q` para `/` e `AltGr+W` para `?`).
+  * *Limitação conhecida (`IntlRo`)*: embora `IntlRo` esteja mapeado no frontend para `KeyRO` (usage HID `0x87` / 135), o descritor USB HID padrão para arranjos ANSI/ISO declara o intervalo de teclas `0..101` (`0x65`), enquanto o descritor estendido (`0..231`) só é ativado hoje no modo `JIS`. Por isso, sob o descritor padrão, `/` e `?` são atendidos via `AltGr+Q` e `AltGr+W`.
 
-### 6. Experiência Mobile e Controle por Toque (Android / iOS)
+### 6. Experiência Mobile e Controle por Toque
 * **Visualização em tela cheia sem cortes ([DesktopMobile.tsx](./ui/src/layout/core/desktop/DesktopMobile.tsx), [useTouchZoom.ts](./ui/src/layout/core/desktop/hooks/useTouchZoom.ts))**:
   * Vídeo com `object-fit: contain` em retrato e paisagem, exibindo 100% da área do monitor remoto sem cortar barras do sistema operacional.
   * Limite de pan/zoom restrito à área real da imagem (desconsiderando as faixas de *letterbox*) e recalculado automaticamente via `ResizeObserver` ao girar a tela ou abrir o teclado.
 * **Teclado virtual móvel com fila serializada ([hidTapQueue.ts](./ui/src/utils/hidTapQueue.ts), [useKeyboardTaps.ts](./ui/src/hooks/useKeyboardTaps.ts), [VirtualKeyboard.tsx](./ui/src/components/VirtualKeyboard.tsx))**:
-  * Substituição dos timers concorrentes de 100 ms por uma fila serializada de pares `press` (35 ms) + `release` (15 ms), preservando letras repetidas em digitação rápida e garantindo a liberação da tecla mesmo ao fechar o teclado, perder foco ou trocar de sessão.
-  * Teclado móvel compacto de 4 linhas com suporte completo ao layout ABNT2 (`ç`, `AltGr`, `\`, acentos e símbolos brasileiros) e abertura com 1 toque na barra inferior.
+  * Substituição dos timers concorrentes de 100 ms por uma fila serializada de pares `press` + `release`, mantendo cada tecla pressionada por **35 ms** com intervalo de **15 ms** entre toques consecutivos. Isso preserva letras repetidas em digitação rápida e tenta enviar a liberação no `finally` pelo mesmo emissor capturado no início do toque (caso o canal de transporte continue disponível).
+  * Teclado móvel compacto de 4 linhas com suporte ao layout ABNT2 (`ç`, `AltGr`, `\`, acentos e símbolos brasileiros). A abertura direta com 1 toque fica na **barra superior móvel e nas ferramentas flutuantes de borda** ([TopBarMobile.tsx](./ui/src/layout/core/bar_top/TopBarMobile.tsx), [bar_autohide](./ui/src/layout/core/bar_autohide/index.tsx)), enquanto o botão de teclado da barra inferior abre o painel de configurações de teclado ([BottomBarMobile.tsx](./ui/src/layout/core/bar_bottom/BottomBarMobile.tsx)).
 * **Gestos de mouse precisos com e sem zoom ([useTouchGestures.ts](./ui/src/layout/core/desktop/hooks/useTouchGestures.ts), [useMouseEvents.ts](./ui/src/layout/core/desktop/hooks/useMouseEvents.ts))**:
   * **1 dedo**: move o cursor sem arrastar involuntariamente (`buttons = 0`), inclusive quando a imagem está ampliada; um toque rápido gera clique esquerdo ao soltar.
   * **Toque longo (1 dedo)**: envia apenas clique direito (`BUTTON_RIGHT`), sem disparar clique esquerdo antes.
   * **Duplo toque + arraste**: mantém o botão esquerdo pressionado no segundo toque para selecionar texto ou mover janelas.
   * **2 dedos**: pinça para zoom e pan da imagem (ou rolagem remota quando o modo de rolagem está ativo), cancelando imediatamente qualquer clique pendente do primeiro dedo.
   * **Modo relativo em telas touch**: acumula frações subpixel e divide movimentos grandes (`> 127 px`) em múltiplos relatórios HID de 8 bits sem depender de Pointer Lock.
+* **Escopo da validação móvel**:
+  * Os fluxos de toque, zoom e teclado virtual foram validados de ponta a ponta usando Chrome no macOS com emulação Android/touch conectado ao stream de vídeo e HID reais do Luckfox (`192.168.11.8`). Não foi realizada validação física em Safari/iOS nesta rodada, e a digitação utiliza o teclado virtual do próprio KVM (não há integração com o teclado nativo/IME do Android).
 
 ### 7. Créditos e Dupla Fonte de Atualização GitHub (`VersionContent.tsx`, `ota.go`)
 * Exibição de créditos e links para os dois repositórios diretamente em **Settings → Version**.
-* Seleção de fonte de atualização OTA entre **`github (jvcardoso)`** (repositório deste fork com fallback para a Luckfox) e **`github (LuckfoxTECH)`** (repositório oficial original), além de `custom` e `local`.
+* Seleção de fonte de atualização OTA entre **`github (jvcardoso)`** (consulta primeiro o fork `jvcardoso/kvm` com fallback para a Luckfox) e **`github (LuckfoxTECH)`** (consulta diretamente os repositórios originais da Luckfox sem passar pelo fork), além de `custom` e `local`.
+* *Nota sobre atualização de sistema (`kvm_system`)*: a verificação de atualização do aplicativo (`kvm_app`) está validada nas duas fontes GitHub. Já a instalação remota de uma nova imagem de sistema (`kvm_system`) exige que o repositório selecionado publique um arquivo de release com hash SHA-256 ou assinatura criptográfica válida, pois `verifyFile` bloqueia pacotes sem verificação de integridade.
 
 ## Compilação (PT-BR)
 * Compilar apenas o frontend:
@@ -126,7 +133,9 @@ Luckfox PicoKVM is a lightweight IP KVM operation and maintenance tool based on 
 
 ## Improvements Added on Top of the Original Project
 
-This build (`AppVersion: 0.1.6` / `SystemVersion: 0.1.9`) introduces comprehensive fixes and enhancements across security, backend concurrency, USB ConfigFS, virtual media, internationalization (`pt-BR` / ABNT2), mobile touch UX, and dual GitHub OTA update sources.
+This application build (`AppVersion: 0.1.6`, tested on top of the device's base `SystemVersion: 0.1.9` image) introduces fixes and enhancements across security, backend concurrency, USB ConfigFS, virtual media, internationalization (`pt-BR` / ABNT2), mobile touch UX, and dual GitHub OTA update sources for the application.
+
+> **Note on the `0.1.6` package:** release `0.1.6` and `picokvm_local_update_0.1.6.zip` contain `version.txt`, `kvm_app`, and `kvm_app.sha256` (`HasSystem=false`, without `update_system.zip`). They update **only the application (`kvm_app` to `0.1.6`)**; the `SystemVersion: 0.1.9` entry in `version.txt` identifies the base system version running on the validated device and does not perform an OS image update.
 
 ### 1. Security, Authentication & Access Control
 * **Administrative endpoint & CORS protection**:
@@ -143,11 +152,12 @@ This build (`AppVersion: 0.1.6` / `SystemVersion: 0.1.9`) introduces comprehensi
   * Restricted default MCP server binding to `127.0.0.1` when no token is configured and enforced constant-time Bearer token comparison (`subtle.ConstantTimeCompare`) when exposed on the network.
 
 ### 2. Backend Stability, Concurrency & Persistence (Go)
-* **Atomic & resilient configuration persistence (`config.go`)**:
-  * Writes configuration via a same-directory temporary file followed by `Sync()`, `Close()`, and atomic `os.Rename()`, preserving a valid `.bak` backup and preventing `/userdata/kvm_config.json` corruption on power loss.
+* **Atomic configuration writes & corrupted file preservation (`config.go`)**:
+  * Writes configuration via a same-directory temporary file followed by `Sync()`, `Close()`, atomic `os.Rename()`, and parent directory `Sync()` to reduce truncation risk on unexpected restarts.
+  * If an invalid or unparseable `/userdata/kvm_config.json` is encountered on load, it is preserved with a `.corrupt.<timestamp>` suffix for diagnosis before applying defaults (a rotating `.bak` backup is not created).
   * Safe migration of legacy or null configuration files without overwriting credentials or failing when no SD card is inserted.
-* **WebRTC session & timer synchronization (`webrtc.go`, `main.go`, `timesync.go`)**:
-  * Protected `currentSession` with a dedicated mutex and atomic session handoff on client disconnect or replacement.
+* **WebRTC session & timer synchronization (`web.go`, `webrtc.go`, `main.go`, `timesync.go`)**:
+  * Managed concurrent `currentSession` access via `atomic.Pointer[Session]` (using atomic `CompareAndSwap`/`Swap` on client disconnect or replacement).
   * Used `atomic.Bool` for NTP synchronization state (`timeSyncDone`) and cleaned up orphaned goroutines in the network statistics collector.
 * **Deadlock & race condition prevention in JSON-RPC and OTA (`jsonrpc.go`, `ota.go`)**:
   * Released configuration locks prior to subsystem calls (display, USB, audio, network) and serialized the OTA update flow with SHA-256 verification before binary replacement.
@@ -157,10 +167,10 @@ This build (`AppVersion: 0.1.6` / `SystemVersion: 0.1.9`) introduces comprehensi
   * Atomic directory exchange (`RENAME_EXCHANGE` on Linux) when installing or updating VPN binaries (Tailscale, ZeroTier, EasyTier, WireGuard) with automatic rollback on failure.
 
 ### 3. USB Gadget & HID Recovery (`internal/usbgadget`)
-* **Fixed DWC3 `failed to start kvm: -19` (`-ENODEV`) endpoint exhaustion**:
-  * The RK3506/RV1106 USB controller has a hardware endpoint limit. When `Audio` (`uac1.usb0`) or `MTP` is enabled, the extra `hid.usb3` (pen/touchscreen) function is now automatically disabled in `HasPenTouch()`, allowing keyboard (`hid.usb0`), absolute mouse (`hid.usb1`), relative mouse (`hid.usb2`), and audio/mass-storage to bind simultaneously without exhausting hardware endpoints.
-* **Clean ConfigFS rebind lifecycle**:
-  * `configureUsbGadget()` executes `ensureGadgetUnbound()` inside `withHIDRebind`, closing open `/dev/hidg*` descriptors before modifying ConfigFS symlinks and rebinding the UDC (`ffb00000.usb`) deterministically.
+* **Mitigated DWC3 `failed to start kvm: -19` (`-ENODEV`) endpoint exhaustion**:
+  * The RK3506/RV1106 USB controller has a hardware endpoint limit. When `Audio` (`uac1.usb0`) or `MTP` is enabled, the extra `hid.usb3` (pen/touchscreen) function is automatically disabled in `HasPenTouch()`, allowing keyboard (`hid.usb0`), absolute mouse (`hid.usb1`), relative mouse (`hid.usb2`), and audio/mass-storage to bind simultaneously in the validated configuration without exhausting endpoints.
+* **Unbind verification during ConfigFS rebind**:
+  * `configureUsbGadget()` executes `ensureGadgetUnbound()` inside `withHIDRebind`, closing open `/dev/hidg*` descriptors, unbinding the `UDC` (`ffb00000.usb`), and aborting reconfiguration if the `UDC` remains bound after the unbind attempt (without forcibly unbinding the platform DWC3 driver during routine config updates).
 
 ### 4. Virtual Media: NBD, WebRTC Disk & HTTP Range (`remote_mount.go`, `block_device.go`, `fuse.go`)
 * **WebRTC & HTTP remote media mounting**:
@@ -170,28 +180,32 @@ This build (`AppVersion: 0.1.6` / `SystemVersion: 0.1.9`) introduces comprehensi
   * Opens `/dev/nbd0` with `O_RDWR`, performs explicit disconnect ioctls (`NBD_CLEAR_SOCK` / `NBD_DISCONNECT`) on shutdown, and actively waits for block readiness before binding to USB Mass Storage.
 
 ### 5. Brazilian Portuguese (`pt-BR`) Localization & ABNT2 Keyboard
-* **Full Brazilian Portuguese translation ([pt.json](./ui/src/locales/pt.json))**:
-  * Complete `pt-BR` UI translation covering menus, settings, ATX power, virtual media, network, VPN, audio, video, terminal, diagnostics, and touch gesture instructions.
+* **Brazilian Portuguese locale dictionary ([pt.json](./ui/src/locales/pt.json))**:
+  * Full key parity with the English dictionary (`en.json`) covering menus, settings, ATX power, virtual media, network, VPN, audio, video, terminal, diagnostics, touch gesture instructions, and keyboard/paste notifications (some programmatic error notifications in other frontend modules still emit literal English strings).
 * **Brazilian ABNT2 keyboard layout (`pt_BR`) ([pt_BR.ts](./ui/src/keyboardLayouts/pt_BR.ts))**:
-  * Full HID scancode mapping for ABNT2, including `ç`/`Ç` (`Semicolon`), slash/question mark (`IntlRo` and `AltGr+Q`/`AltGr+W`), backslash/pipe (`IntlBackslash`), dead-key accents (`´`, `` ` ``, `~`, `^`, `¨`), and `AltGr` combinations.
+  * ABNT2 mapping including `ç`/`Ç` (`Semicolon`), backslash/pipe (`IntlBackslash`), dead-key accents (`´`, `` ` ``, `~`, `^`, `¨`), and `AltGr` combinations (such as `AltGr+Q` for `/` and `AltGr+W` for `?`).
+  * *Known limitation (`IntlRo`)*: although `IntlRo` is mapped in the frontend to `KeyRO` (HID usage `0x87` / 135), the default USB HID keyboard descriptor for ANSI/ISO arrangements declares usage range `0..101` (`0x65`), while the extended `0..231` descriptor is currently enabled only for `JIS`. Under the default descriptor, `/` and `?` are therefore typed via `AltGr+Q` and `AltGr+W`.
 
-### 6. Mobile Experience & Touch Control (Android / iOS)
+### 6. Mobile Experience & Touch Control
 * **Uncropped full-screen video ([DesktopMobile.tsx](./ui/src/layout/core/desktop/DesktopMobile.tsx), [useTouchZoom.ts](./ui/src/layout/core/desktop/hooks/useTouchZoom.ts))**:
   * Uses `object-fit: contain` in both portrait and landscape orientations so 100% of the remote desktop is visible without cropping OS taskbars or menus.
   * Clamps pan/zoom boundaries to the actual video content area (excluding letterbox bars) and recalculates automatically via `ResizeObserver` on screen rotation or keyboard toggle.
 * **Serialized virtual keyboard tap queue ([hidTapQueue.ts](./ui/src/utils/hidTapQueue.ts), [useKeyboardTaps.ts](./ui/src/hooks/useKeyboardTaps.ts), [VirtualKeyboard.tsx](./ui/src/components/VirtualKeyboard.tsx))**:
-  * Replaces concurrent 100 ms release timers with a serialized queue of `press` (35 ms) + `release` (15 ms) pairs, preserving repeated letters during fast typing and guaranteeing key release on keyboard close, blur, or session change.
-  * Compact 4-row mobile keyboard with full ABNT2 support (`ç`, `AltGr`, `\`, dead-key accents, and dynamic layout labels) and single-tap open from the bottom bar.
+  * Replaces concurrent 100 ms release timers with a serialized queue of `press` + `release` pairs, holding each key press for **35 ms** with a **15 ms** gap between consecutive taps. This preserves repeated letters during fast typing and attempts key release in `finally` using the sender captured at tap start (provided the transport channel remains available).
+  * Compact 4-row mobile keyboard with ABNT2 support (`ç`, `AltGr`, `\`, dead-key accents, and dynamic layout labels). Direct 1-tap toggle is located in the **top mobile bar and floating edge toolbar** ([TopBarMobile.tsx](./ui/src/layout/core/bar_top/TopBarMobile.tsx), [bar_autohide](./ui/src/layout/core/bar_autohide/index.tsx)), whereas the bottom bar keyboard button opens the Keyboard settings drawer ([BottomBarMobile.tsx](./ui/src/layout/core/bar_bottom/BottomBarMobile.tsx)).
 * **Precision touch mouse gestures with and without zoom ([useTouchGestures.ts](./ui/src/layout/core/desktop/hooks/useTouchGestures.ts), [useMouseEvents.ts](./ui/src/layout/core/desktop/hooks/useMouseEvents.ts))**:
   * **1 finger**: moves the cursor without unintended dragging (`buttons = 0`), even while zoomed in; a quick tap emits a left click on release.
   * **Long press (1 finger)**: emits only a right click (`BUTTON_RIGHT`) without firing a prior left click.
   * **Double-tap & drag**: holds the left mouse button on the second touch to select text or drag windows.
   * **2 fingers**: pinch-to-zoom and pan the image (or scroll the remote host when scroll mode is selected), immediately cancelling any pending single-finger tap.
   * **Relative mouse mode on touch**: accumulates subpixel deltas and splits large movements (`> 127 px`) into valid 8-bit signed HID reports without requiring Pointer Lock.
+* **Mobile validation scope**:
+  * Touch mouse gestures, zoom clamping, and the virtual keyboard tap queue were validated end-to-end using Chrome on macOS with Android/touch emulation connected to the real Luckfox video and HID stream (`192.168.11.8`). Physical Safari/iOS testing was not performed in this cycle, and text entry uses the KVM's on-screen virtual keyboard (no native Android IME/Gboard integration).
 
 ### 7. Credits & Dual GitHub Update Sources (`VersionContent.tsx`, `ota.go`)
 * Displays project credits and clickable links to both repositories directly in **Settings → Version**.
-* Allows selecting the OTA update source between **`github (jvcardoso)`** (this fork's releases with automatic fallback to Luckfox) and **`github (LuckfoxTECH)`** (official upstream releases), in addition to `custom` and `local`.
+* Allows selecting the OTA update source between **`github (jvcardoso)`** (queries this fork first with automatic fallback to Luckfox) and **`github (LuckfoxTECH)`** (queries the official upstream repositories directly without checking the fork), in addition to `custom` and `local`.
+* *Note on system updates (`kvm_system`)*: application update checks (`kvm_app`) are validated across both GitHub sources. Remote system image updates (`kvm_system`), however, require the selected repository to publish a release archive with a valid SHA-256 digest or cryptographic signature, as `verifyFile` rejects archives without integrity metadata.
 
 ## Compilation (English)
 * Compile frontend only:

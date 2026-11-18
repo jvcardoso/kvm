@@ -131,6 +131,11 @@ var UpdateGithubSystemReleaseUrls = []string{
 	"https://api.github.com/repos/luckfox-eng29/kvm_system/releases/latest",
 }
 
+var UpdateGithubUpstreamSystemReleaseUrls = []string{
+	"https://api.github.com/repos/LuckfoxTECH/kvm_system/releases/latest",
+	"https://api.github.com/repos/luckfox-eng29/kvm_system/releases/latest",
+}
+
 var UpdateGiteeSystemReleaseUrls = []string{
 	"https://gitee.com/api/v5/repos/LuckfoxTECH/kvm_system/releases/latest",
 	"https://gitee.com/api/v5/repos/luckfox-eng29/kvm_system/releases/latest",
@@ -361,7 +366,9 @@ func pickZipAssetURL(assets []releaseAsset) string {
 func fetchKvmSystemLatestRelease(ctx context.Context) (tag string, zipURL string, hash string, sigURL string, err error) {
 	apiURLs := UpdateGithubSystemReleaseUrls
 	fallbackToGithub := false
-	if updateSource == updateSourceGitee {
+	if updateSource == updateSourceGithubUpstream {
+		apiURLs = UpdateGithubUpstreamSystemReleaseUrls
+	} else if updateSource == updateSourceGitee {
 		apiURLs = UpdateGiteeSystemReleaseUrls
 		fallbackToGithub = true
 	}
@@ -1505,7 +1512,7 @@ func TryUpdate(ctx context.Context, deviceId string) error {
 			Msg("System update available")
 
 		systemTarPath := "/userdata/picokvm/update_system.tar"
-		if updateSource == updateSourceGithub || updateSource == updateSourceGitee {
+		if updateSource == updateSourceGithub || updateSource == updateSourceGithubUpstream || updateSource == updateSourceGitee {
 			err := prepareSystemUpdateTarFromKvmSystemZip(
 				ctx,
 				remote.SystemUrl,

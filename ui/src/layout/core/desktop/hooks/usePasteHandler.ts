@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import { useReactAt } from "i18n-auto-extractor/react";
 
 import { useJsonRpc } from "@/hooks/useJsonRpc";
 import { useSettingsStore, useHidStore, useUiStore } from "@/hooks/stores";
@@ -8,6 +9,7 @@ import notifications from "@/notifications";
 import { eventMatchesShortcut } from "@/utils/shortcuts";
 
 export const usePasteHandler = (pasteCaptureRef?: React.RefObject<HTMLTextAreaElement>) => {
+  const { $at } = useReactAt();
   const [send] = useJsonRpc();
   const pasteShortcutEnabled = useSettingsStore(state => state.pasteShortcutEnabled);
   const pasteShortcut = useSettingsStore(state => state.pasteShortcut);
@@ -105,7 +107,7 @@ export const usePasteHandler = (pasteCaptureRef?: React.RefObject<HTMLTextAreaEl
     if (!txt) return;
     const invalid = getInvalidCharacters(txt);
     if (invalid.length > 0) {
-      notifications.error(`Invalid characters: ${invalid.join(", ")}`);
+      notifications.error(`${$at("Invalid characters")}: ${invalid.join(", ")}`);
       log("invalid chars", invalid, { safeKeyboardLayout, normalizedKeyboardLayout, keyboardLayout });
       return;
     }
@@ -117,15 +119,15 @@ export const usePasteHandler = (pasteCaptureRef?: React.RefObject<HTMLTextAreaEl
 
     try {
       await sendTextViaHID(txt);
-      notifications.success(`Pasted: "${txt}"`);
+      notifications.success(`${$at("Pasted")}: "${txt}"`);
       log("sent text", { length: txt.length });
     } catch (err) {
-      notifications.error("Failed to paste text");
+      notifications.error($at("Failed to paste text"));
       log("send failed", err);
     } finally {
       restoreFocusTrapNow();
     }
-  }, [getInvalidCharacters, isReinitializingGadget, keyboardLayout, log, normalizedKeyboardLayout, restoreFocusTrapNow, safeKeyboardLayout, sendTextViaHID]);
+  }, [$at, getInvalidCharacters, isReinitializingGadget, keyboardLayout, log, normalizedKeyboardLayout, restoreFocusTrapNow, safeKeyboardLayout, sendTextViaHID]);
 
   useEffect(() => {
     send("getKeyboardLayout", {}, resp => {

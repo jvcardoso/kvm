@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import { useReactAt } from "i18n-auto-extractor/react";
 
 import { useHidStore, useRTCStore, useSettingsStore } from "@/hooks/stores";
 import { createHidTapQueue } from "@/utils/hidTapQueue";
@@ -8,6 +9,9 @@ type Sender = (keys: number[], modifiers: number[], forceRelease?: boolean,
   onComplete?: (error?: Error) => void) => boolean;
 
 export function useKeyboardTaps(send: Sender, enabled: boolean) {
+  const { $at } = useReactAt();
+  const errorTextRef = useRef($at("Failed to send keyboard input"));
+  errorTextRef.current = $at("Failed to send keyboard input");
   const usbReady = useHidStore(state => state.usbState === "configured" &&
     state.usbEmulationEnabled && state.usbKeyboardEnabled && !state.isReinitializingGadget);
   const forceHttp = useSettingsStore(state => state.forceHttp);
@@ -18,7 +22,7 @@ export function useKeyboardTaps(send: Sender, enabled: boolean) {
   if (!queue.current) {
     queue.current = createHidTapQueue({
       send: report => report(),
-      onError: () => notifications.error("Failed to send keyboard input"),
+      onError: () => notifications.error(errorTextRef.current),
     });
   }
 
