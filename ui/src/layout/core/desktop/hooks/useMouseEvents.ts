@@ -75,6 +75,9 @@ export const useMouseEvents = (
   // Last position sent in an absolute-position mode, in HID units. A release
   // report has to repeat it, because the position is only sent when it changes.
   const lastPointerRef = useRef({ x: 0, y: 0 });
+  const hasPointerPositionRef = useRef(false);
+  const lastRelativeTouchRef = useRef<{ x: number; y: number } | null>(null);
+  const relativeFractionRef = useRef({ x: 0, y: 0 });
   // Fingers currently down, keyed by pointer ID, with their contact slot.
   const activeTouchesRef = useRef<Map<number, { slot: number; x: number; y: number; down: boolean }>>(new Map());
   // A lifted contact stays in the map just long enough to carry its release.
@@ -92,21 +95,33 @@ export const useMouseEvents = (
   };
 
   const sendRelMouseMovement = useCallback(
-    (x: number, y: number, buttons: number, force = false) => {
+    (x: number, y: number, buttons: number, force = false, precise = false) => {
       if (!force && settings.mouseMode !== "relative") return;
       // Don't send mouse events while reinitializing gadget
       if (isReinitializingGadget) return;
       // The mouse interfaces are switched off on the device. Reporting movement
       // would only fail and can retrigger a gadget reinitialization.
       if (!mouseEnabled) return;
-      const dx = calcDelta(x);
-      const dy = calcDelta(y);
-      if (rpcHidReady) {
-        reportRelMouseEvent(dx, dy, buttons);
-      } else {
-        // kept for backward compatibility
-        sendNotification("relMouseReport", { dx, dy, buttons });
-      }
+      const scaledX = precise ? x * settings.mouseSensitivity : calcDelta(x);
+      const scaledY = precise ? y * settings.mouseSensitivity : calcDelta(y);
+      if (!Number.isFinite(scaledX) || !Number.isFinite(scaledY)) return;
+      const totalX = scaledX + relativeFractionRef.current.x;
+      const totalY = scaledY + relativeFractionRef.current.y;
+      const wholeX = Math.trunc(totalX);
+      const wholeY = Math.trunc(totalY);
+      relativeFractionRef.current = { x: totalX - wholeX, y: totalY - wholeY };
+      let dx = Math.max(-32767, Math.min(32767, wholeX));
+      let dy = Math.max(-32767, Math.min(32767, wholeY));
+      // A relative report has signed-byte axes. Split fast swipes instead of
+      // dropping the report when its movement exceeds the wire range.
+      do {
+        const stepX = Math.max(-127, Math.min(127, dx));
+        const stepY = Math.max(-127, Math.min(127, dy));
+        if (rpcHidReady) reportRelMouseEvent(stepX, stepY, buttons);
+        else sendNotification("relMouseReport", { dx: stepX, dy: stepY, buttons });
+        dx -= stepX;
+        dy -= stepY;
+      } while (dx !== 0 || dy !== 0);
       setMouseMove({ x, y, buttons });
     },
     [sendNotification, reportRelMouseEvent, rpcHidReady, setMouseMove, settings.mouseMode, settings.mouseSensitivity, isReinitializingGadget, mouseEnabled],
@@ -129,6 +144,7 @@ export const useMouseEvents = (
         sendNotification("absMouseReport", { x, y, buttons });
       }
       lastPointerRef.current = { x, y };
+      hasPointerPositionRef.current = true;
       setMousePosition(x, y);
     },
     [sendNotification, reportAbsMouseEvent, rpcHidReady, setMousePosition, settings.mouseMode, isReinitializingGadget, mouseEnabled],
@@ -163,6 +179,7 @@ export const useMouseEvents = (
         sendNotification("absMouseReport", { x, y, buttons });
       }
       lastPointerRef.current = { x, y };
+      hasPointerPositionRef.current = true;
       setMousePosition(x, y);
     },
     [sendNotification, reportPenEvent, rpcHidReady, setMousePosition, settings.mouseMode, isReinitializingGadget, mouseEnabled],
@@ -293,6 +310,23 @@ export const useMouseEvents = (
     [dispatchAbsMovement],
   );
 
+  const clearPendingPointerMoves = useCallback(() => {
+    if (relMouseFrameRef.current !== null) cancelAnimationFrame(relMouseFrameRef.current);
+    if (absMouseFrameRef.current !== null) cancelAnimationFrame(absMouseFrameRef.current);
+    relMouseFrameRef.current = null;
+    absMouseFrameRef.current = null;
+    pendingRelMouseRef.current = null;
+    pendingAbsMouseRef.current = null;
+  }, []);
+
+  const flushPendingPointerMoves = useCallback(() => {
+    const relative = pendingRelMouseRef.current;
+    const absolute = pendingAbsMouseRef.current;
+    clearPendingPointerMoves();
+    if (relative) sendRelMouseMovement(relative.x, relative.y, relative.buttons);
+    if (absolute) dispatchAbsMovement(absolute.x, absolute.y, absolute.buttons);
+  }, [clearPendingPointerMoves, sendRelMouseMovement, dispatchAbsMovement]);
+
   // Convert a pointer position inside the video element to HID absolute
   // coordinates, compensating for the letterboxing of a mismatched aspect ratio.
   const mapToHidCoords = useCallback(
@@ -342,11 +376,18 @@ export const useMouseEvents = (
   // mouse uses, so calibration and letterboxing are applied exactly once.
   const emitTouchPoint = useCallback(
     (clientX: number, clientY: number, buttons: number) => {
+      if (settings.mouseMode === "relative") {
+        const previous = lastRelativeTouchRef.current;
+        lastRelativeTouchRef.current = { x: clientX, y: clientY };
+        sendRelMouseMovement(previous ? clientX - previous.x : 0,
+          previous ? clientY - previous.y : 0, buttons | externalButtons, false, true);
+        return;
+      }
       const coords = mapToHidCoords(clientX, clientY);
       if (!coords) return;
       sendAbsMouseMovement(coords.x, coords.y, buttons | externalButtons);
     },
-    [mapToHidCoords, sendAbsMouseMovement, externalButtons],
+    [mapToHidCoords, sendAbsMouseMovement, externalButtons, settings.mouseMode, sendRelMouseMovement],
   );
 
   const touchGestures = useTouchGestures({ emit: emitTouchPoint, tapToClick: !disableTouchClick });
@@ -358,12 +399,9 @@ export const useMouseEvents = (
     if (settings.mouseMode === "touch-screen") return;
     if (multiTouchReleaseSentRef.current) return;
     multiTouchReleaseSentRef.current = true;
-    if (settings.mouseMode === "relative") {
-      sendRelMouseMovement(0, 0, 0);
-      return;
-    }
-    dispatchAbsMovement(lastPointerRef.current.x, lastPointerRef.current.y, externalButtons);
-  }, [settings.mouseMode, sendRelMouseMovement, dispatchAbsMovement, externalButtons]);
+    touchGestures.cancel();
+    lastRelativeTouchRef.current = null;
+  }, [settings.mouseMode, touchGestures.cancel]);
 
   const relMouseMoveHandler = useCallback(
     (e: MouseEvent) => {
@@ -386,6 +424,19 @@ export const useMouseEvents = (
         e.preventDefault();
       }
       if (settings.mouseMode !== "relative") return;
+      if (pt === "touch") {
+        const event = e as unknown as PointerEvent;
+        if (eventType === "pointerdown") {
+          lastRelativeTouchRef.current = { x: event.clientX, y: event.clientY };
+          try { videoElm.current?.setPointerCapture(event.pointerId); } catch { /* synthetic or canceled pointer */ }
+          touchGestures.handleDown(event);
+        } else if (eventType === "pointermove") touchGestures.handleMove(event);
+        else {
+          touchGestures.handleUp(event);
+          lastRelativeTouchRef.current = null;
+        }
+        return;
+      }
       if (!pointerLock.isPointerLockActive && pointerLock.isPointerLockPossible) return;
 
       const { buttons } = e;
@@ -394,9 +445,10 @@ export const useMouseEvents = (
         return;
       }
 
-      sendRelMouseMovement(e.movementX, e.movementY, buttons);
+      flushPendingPointerMoves();
+      sendRelMouseMovement(0, 0, buttons);
     },
-    [pointerLock.isPointerLockActive, pointerLock.isPointerLockPossible, queueRelMouseMovement, sendRelMouseMovement, settings.mouseMode, touchZoom, releaseForMultiTouchGesture],
+    [pointerLock.isPointerLockActive, pointerLock.isPointerLockPossible, queueRelMouseMovement, sendRelMouseMovement, settings.mouseMode, touchZoom, releaseForMultiTouchGesture, touchGestures, videoElm, flushPendingPointerMoves],
   );
 
   // Absolute, pen and a single-finger drag: one handler for all absolute-position
@@ -415,7 +467,6 @@ export const useMouseEvents = (
             // The press went out with the first finger; hand the release over
             // before the gesture takes the pointers away.
             releaseForMultiTouchGesture();
-            touchGestures.reset();
             return;
           }
         }
@@ -430,7 +481,10 @@ export const useMouseEvents = (
       if (pt === "touch" && settings.mouseMode !== "touch-screen") {
         // Single-finger touch is arbitrated in useTouchGestures: dead zone,
         // smoothing, long press and double tap all live there.
-        if (eventType === "pointerdown") touchGestures.handleDown(pointerEvent);
+        if (eventType === "pointerdown") {
+          try { videoElm.current?.setPointerCapture(pointerEvent.pointerId); } catch { /* synthetic or canceled pointer */ }
+          touchGestures.handleDown(pointerEvent);
+        }
         else if (eventType === "pointermove") touchGestures.handleMove(pointerEvent);
         else touchGestures.handleUp(pointerEvent);
         return;
@@ -446,9 +500,10 @@ export const useMouseEvents = (
         return;
       }
 
+      flushPendingPointerMoves();
       dispatchAbsMovement(coords.x, coords.y, buttons);
     },
-    [settings.mouseMode, mapToHidCoords, queueAbsMouseMovement, dispatchAbsMovement, touchZoom, touchGestures, externalButtons, videoElm, releaseForMultiTouchGesture],
+    [settings.mouseMode, mapToHidCoords, queueAbsMouseMovement, dispatchAbsMovement, touchZoom, touchGestures, externalButtons, videoElm, releaseForMultiTouchGesture, flushPendingPointerMoves],
   );
 
   // Touch screen mode: every pointer on the video becomes a finger of its own, so
@@ -626,6 +681,12 @@ export const useMouseEvents = (
   // Release whatever the current mode has pressed, so switching modes, losing the
   // window or leaving the page cannot leave a stuck tip, finger or button.
   const resetMousePosition = useCallback(() => {
+    clearPendingPointerMoves();
+    lastRelativeTouchRef.current = null;
+    if (settings.mouseMode === "relative") {
+      sendRelMouseMovement(0, 0, 0);
+      return;
+    }
     if (settings.mouseMode === "touch-screen") {
       // Always send the empty report: the host may still hold a contact we no
       // longer track, and one idle report costs nothing next to a stuck finger.
@@ -633,6 +694,8 @@ export const useMouseEvents = (
       sendTouchContacts();
       return;
     }
+
+    if (!hasPointerPositionRef.current) return;
 
     if (settings.mouseMode === "digitizer-stylus") {
       if (!rpcHidReady || !mouseEnabled || isReinitializingGadget) return;
@@ -653,6 +716,8 @@ export const useMouseEvents = (
     clearTouchContacts,
     sendTouchContacts,
     sendAbsMovement,
+    sendRelMouseMovement,
+    clearPendingPointerMoves,
   ]);
 
   // Mode changes must release in the mode being left, while its report type is
@@ -663,6 +728,12 @@ export const useMouseEvents = (
     if (previousMode === settings.mouseMode) return;
 
     previousMouseModeRef.current = settings.mouseMode;
+    const hadPointerPosition = hasPointerPositionRef.current;
+    hasPointerPositionRef.current = false;
+    clearPendingPointerMoves();
+    touchGestures.reset();
+    lastRelativeTouchRef.current = null;
+    relativeFractionRef.current = { x: 0, y: 0 };
 
     if (isReinitializingGadget || !rpcHidReady) return;
 
@@ -676,10 +747,13 @@ export const useMouseEvents = (
         reportPenEvent(position.x, position.y, 0, 0);
         break;
       case "absolute":
-        reportAbsMouseEvent(position.x, position.y, 0);
+        if (hadPointerPosition) reportAbsMouseEvent(position.x, position.y, 0);
+        break;
+      case "relative":
+        reportRelMouseEvent(0, 0, 0);
         break;
     }
-  }, [settings.mouseMode, isReinitializingGadget, rpcHidReady, reportTouchEvent, reportPenEvent, reportAbsMouseEvent, clearTouchContacts]);
+  }, [settings.mouseMode, isReinitializingGadget, rpcHidReady, reportTouchEvent, reportPenEvent, reportAbsMouseEvent, clearTouchContacts, reportRelMouseEvent, clearPendingPointerMoves, touchGestures.reset]);
 
   const isRelativeMouseMode = (settings.mouseMode === "relative");
   const isTouchScreenMode = (settings.mouseMode === "touch-screen");
@@ -720,17 +794,18 @@ export const useMouseEvents = (
 
     if (isRelativeMouseMode) {
       videoElmRefValue.addEventListener("click",
-        () => {
+        (event: MouseEvent) => {
+          if (isMobile || (event as PointerEvent).pointerType === "touch") return;
           if (pointerLock.isPointerLockPossible && !pointerLock.isPointerLockActive && !document.pointerLockElement) {
             pointerLock.requestPointerLock();
           }
         },
         { signal },
       );
-    } else {
-      window.addEventListener("blur", resetMousePosition, { signal });
-      document.addEventListener("visibilitychange", resetMousePosition, { signal });
     }
+    window.addEventListener("blur", resetMousePosition, { signal });
+    window.addEventListener("resize", resetMousePosition, { signal });
+    document.addEventListener("visibilitychange", resetMousePosition, { signal });
 
     const preventContextMenu = (e: MouseEvent) => e.preventDefault();
     videoElmRefValue.addEventListener("contextmenu", preventContextMenu, { signal });
@@ -760,7 +835,9 @@ export const useMouseEvents = (
     isRelativeMouseMode,
     // Removed relMouseMoveHandler and absMouseMoveHandler from dependencies to prevent re-binding
     mouseWheelHandler,
-    pointerLock,
+    pointerLock.isPointerLockPossible,
+    pointerLock.isPointerLockActive,
+    pointerLock.requestPointerLock,
     resetMousePosition
   ]);
 
@@ -769,5 +846,6 @@ export const useMouseEvents = (
     sendVirtualRelativeMovement,
     sendAbsMouseMovement,
     sendWheelReport,
+    cancelTouchGesture: touchGestures.cancel,
   };
 };

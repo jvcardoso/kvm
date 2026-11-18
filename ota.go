@@ -201,7 +201,7 @@ func fetchUpdateMetadata(ctx context.Context, deviceId string) (*RemoteMetadata,
 		return nil, err
 	}
 
-	systemVersionRemote, systemZipURL, systemSigURL, err := fetchKvmSystemLatestRelease(ctx)
+	systemVersionRemote, systemZipURL, systemHash, systemSigURL, err := fetchKvmSystemLatestRelease(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +213,7 @@ func fetchUpdateMetadata(ctx context.Context, deviceId string) (*RemoteMetadata,
 		AppSigUrl:     appSigURL,
 		SystemUrl:     systemZipURL,
 		SystemVersion: systemVersionRemote,
+		SystemHash:    systemHash,
 		SystemSigUrl:  systemSigURL,
 	}, nil
 }
@@ -345,7 +346,7 @@ func pickZipAssetURL(assets []releaseAsset) string {
 	return ""
 }
 
-func fetchKvmSystemLatestRelease(ctx context.Context) (tag string, zipURL string, sigURL string, err error) {
+func fetchKvmSystemLatestRelease(ctx context.Context) (tag string, zipURL string, hash string, sigURL string, err error) {
 	apiURLs := UpdateGithubSystemReleaseUrls
 	fallbackToGithub := false
 	if updateSource == updateSourceGitee {
@@ -407,11 +408,16 @@ func fetchKvmSystemLatestRelease(ctx context.Context) (tag string, zipURL string
 				sysSigURL = strings.TrimSpace(asset.BrowserDownloadURL)
 			}
 		}
-		if u := pickZipAssetURL(release.Assets); strings.TrimSpace(u) != "" {
-			return tag, strings.TrimSpace(u), sysSigURL, nil
+		if u := pickZipAssetURL(release.Assets); u != "" {
+			for _, asset := range release.Assets {
+				if strings.TrimSpace(asset.BrowserDownloadURL) == u {
+					hash, _ := strings.CutPrefix(strings.TrimSpace(asset.Digest), "sha256:")
+					return tag, u, hash, sysSigURL, nil
+				}
+			}
 		}
 		if strings.TrimSpace(release.ZipballURL) != "" {
-			return tag, strings.TrimSpace(release.ZipballURL), sysSigURL, nil
+			return tag, strings.TrimSpace(release.ZipballURL), "", sysSigURL, nil
 		}
 
 		lastErr = fmt.Errorf("no usable system archive url in release response from %s", apiURL)
@@ -492,15 +498,15 @@ func fetchKvmSystemLatestRelease(ctx context.Context) (tag string, zipURL string
 						zipTag = strings.TrimPrefix(zipTag, "V")
 					}
 					zipURL := strings.TrimRight(selectedZipURL, "/") + "/" + zipTag + ".zip"
-					return githubTag, zipURL, "", nil
+					return githubTag, zipURL, "", "", nil
 				}
 				githubErr = fmt.Errorf("no gitee system zip urls configured")
 				break
 			}
 		}
-		return "", "", "", fmt.Errorf("gitee system release fetch failed (%v); github fallback failed (%w)", lastErr, githubErr)
+		return "", "", "", "", fmt.Errorf("gitee system release fetch failed (%v); github fallback failed (%w)", lastErr, githubErr)
 	}
-	return "", "", "", lastErr
+	return "", "", "", "", lastErr
 }
 
 func fetchUpdateMetadataFromBaseURL(ctx context.Context, baseURL string) (*RemoteMetadata, error) {
@@ -776,10 +782,10 @@ func shouldProxyUpdateDownloadURL(u *url.URL) bool {
 }
 
 func applyUpdateDownloadProxyPrefix(rawURL string) string {
-	if config == nil {
+	if configSnapshot() == nil {
 		return rawURL
 	}
-	proxy := strings.TrimSpace(config.UpdateDownloadProxy)
+	proxy := strings.TrimSpace(configSnapshot().UpdateDownloadProxy)
 	if proxy == "" {
 		return rawURL
 	}
@@ -964,16 +970,18 @@ func downloadFile(
 
 	file.Close()
 
-	// Flush filesystem buffers to ensure all data is written to disk
-	err = exec.Command("sync").Run()
-	if err != nil {
-		otaLogger.Warn().Err(err).Msg("Failed to flush filesystem buffers")
-	}
+	// Only flush and drop page caches after large firmware downloads (> 1 MiB)
+	// so small signature/checksum downloads do not thrash kernel caches or flash.
+	if written >= 1024*1024 {
+		err = exec.Command("sync").Run()
+		if err != nil {
+			otaLogger.Warn().Err(err).Msg("Failed to flush filesystem buffers")
+		}
 
-	// Clear the filesystem caches to force a read from disk
-	err = os.WriteFile("/proc/sys/vm/drop_caches", []byte("1"), 0o644)
-	if err != nil {
-		otaLogger.Warn().Err(err).Msg("Failed to clear filesystem caches")
+		err = os.WriteFile("/proc/sys/vm/drop_caches", []byte("1"), 0o644)
+		if err != nil {
+			otaLogger.Warn().Err(err).Msg("Failed to clear filesystem caches")
+		}
 	}
 
 	// without check
@@ -997,6 +1005,7 @@ func prepareSystemUpdateTarFromKvmSystemZip(
 	verificationProgress *float32,
 	sigURL string,
 	expectedHash string,
+	signatureVerified *bool,
 	scopedLogger *zerolog.Logger,
 ) error {
 	if scopedLogger == nil {
@@ -1039,25 +1048,13 @@ func prepareSystemUpdateTarFromKvmSystemZip(
 
 		if err := downloadFile(ctx, zipPath, zipURL, downloadProgress, downloadSpeedBps); err != nil {
 			lastErr = err
+		} else if err := verifyFile(ctx, zipPath, expectedHash, sigURL, verificationProgress, signatureVerified, scopedLogger); err != nil {
+			lastErr = fmt.Errorf("system zip verification failed: %w", err)
+		} else if err := unzipArchive(zipPath, extractDir); err != nil {
+			lastErr = err
 		} else {
-			zipUnverifiedPath := zipPath + ".unverified"
-			if _, err := os.Stat(zipUnverifiedPath); err != nil {
-				lastErr = fmt.Errorf("downloaded zip not found: %s: %w", zipUnverifiedPath, err)
-			} else if sigURL != "" || expectedHash != "" {
-				if err := verifyFile(ctx, zipPath, expectedHash, sigURL, verificationProgress, scopedLogger); err != nil {
-					lastErr = fmt.Errorf("system zip verification failed: %w", err)
-				} else if err := unzipArchive(zipUnverifiedPath, extractDir); err != nil {
-					lastErr = err
-				} else {
-					lastErr = nil
-					break
-				}
-			} else if err := unzipArchive(zipUnverifiedPath, extractDir); err != nil {
-				lastErr = err
-			} else {
-				lastErr = nil
-				break
-			}
+			lastErr = nil
+			break
 		}
 
 		_ = os.Remove(zipPath + ".unverified")
@@ -1134,9 +1131,8 @@ func prepareSystemUpdateTarFromKvmSystemZip(
 	if err := os.RemoveAll(extractDir); err != nil {
 		scopedLogger.Warn().Err(err).Str("path", extractDir).Msg("Failed to cleanup extracted system zip")
 	}
-	zipUnverifiedPath := zipPath + ".unverified"
-	if err := os.Remove(zipUnverifiedPath); err != nil {
-		scopedLogger.Warn().Err(err).Str("path", zipUnverifiedPath).Msg("Failed to cleanup system zip")
+	if err := os.Remove(zipPath); err != nil {
+		scopedLogger.Warn().Err(err).Str("path", zipPath).Msg("Failed to cleanup system zip")
 	}
 
 	return nil
@@ -1197,46 +1193,58 @@ func unzipArchive(zipPath string, destDir string) error {
 	return nil
 }
 
-func verifyFile(ctx context.Context, path string, expectedHash string, sigURL string, verifyProgress *float32, scopedLogger *zerolog.Logger) error {
+func verifyFile(ctx context.Context, path string, expectedHash string, sigURL string, verifyProgress *float32, signatureVerified *bool, scopedLogger *zerolog.Logger) error {
 	if scopedLogger == nil {
 		scopedLogger = otaLogger
 	}
 
 	unverifiedPath := path + ".unverified"
 
-	if strings.TrimSpace(sigURL) == "" && strings.TrimSpace(expectedHash) == "" {
-		return fmt.Errorf("refusing to flash unverified firmware: no signature URL and no hash provided")
-	}
-
-	if strings.TrimSpace(sigURL) != "" {
+	expectedHash = strings.TrimSpace(expectedHash)
+	sigURL = strings.TrimSpace(sigURL)
+	requireSignature := strings.TrimSpace(builtOtaPublicKey) != ""
+	sigVerified := false
+	if sigURL != "" {
 		sigBasePath := path + ".sig"
-		sigDownloadErr := downloadFile(ctx, sigBasePath, sigURL, nil, nil)
 		sigPath := sigBasePath + ".unverified"
-		if sigDownloadErr != nil {
-			scopedLogger.Warn().Err(sigDownloadErr).Str("sigURL", sigURL).Msg("failed to download signature file, falling back to hash-only verification")
+		defer os.Remove(sigPath)
+		if err := downloadFile(ctx, sigBasePath, sigURL, nil, nil); err != nil {
+			if requireSignature || expectedHash == "" {
+				return fmt.Errorf("failed to download firmware signature: %w", err)
+			}
+			scopedLogger.Warn().Err(err).Msg("failed to download signature, checking SHA-256")
 		} else {
-			sigPresent, sigErr := verifyFileSignature(unverifiedPath, sigPath, scopedLogger)
-			_ = os.Remove(sigPath)
-			if sigPresent && sigErr != nil {
-				return fmt.Errorf("signature verification failed: %w", sigErr)
+			present, err := verifyFileSignature(unverifiedPath, sigPath, scopedLogger)
+			if err != nil {
+				return fmt.Errorf("signature verification failed: %w", err)
 			}
-			if sigPresent && sigErr == nil {
-				scopedLogger.Info().Str("path", path).Msg("firmware signature verified, proceeding to hash check")
-			}
+			sigVerified = present
 		}
-	} else {
-		scopedLogger.Info().Str("path", path).Msg("no signature URL provided, skipping signature verification")
 	}
+	if requireSignature && !sigVerified {
+		return fmt.Errorf("firmware signature is required")
+	}
+	if !sigVerified && expectedHash == "" {
+		return fmt.Errorf("refusing to flash firmware without a verified signature or hash")
+	}
+	if expectedHash != "" {
+		if err := verifyOTAHash(ctx, unverifiedPath, expectedHash, verifyProgress, scopedLogger); err != nil {
+			return err
+		}
+	}
+	if err := os.Chmod(unverifiedPath, 0o755); err != nil {
+		return fmt.Errorf("error making file executable: %w", err)
+	}
+	if err := os.Rename(unverifiedPath, path); err != nil {
+		return fmt.Errorf("error publishing verified firmware: %w", err)
+	}
+	if signatureVerified != nil {
+		*signatureVerified = sigVerified
+	}
+	return nil
+}
 
-	if strings.TrimSpace(expectedHash) == "" {
-		if err := os.Rename(unverifiedPath, path); err != nil {
-			return fmt.Errorf("error renaming file: %w", err)
-		}
-		if err := os.Chmod(path, 0o755); err != nil {
-			return fmt.Errorf("error making file executable: %w", err)
-		}
-		return nil
-	}
+func verifyOTAHash(ctx context.Context, unverifiedPath, expectedHash string, verifyProgress *float32, scopedLogger *zerolog.Logger) error {
 
 	fileToHash, err := os.Open(unverifiedPath)
 	if err != nil {
@@ -1255,6 +1263,9 @@ func verifyFile(ctx context.Context, path string, expectedHash string, sigURL st
 	verified := int64(0)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		nr, er := fileToHash.Read(buf)
 		if nr > 0 {
 			nw, ew := hash.Write(buf[0:nr])
@@ -1266,7 +1277,7 @@ func verifyFile(ctx context.Context, path string, expectedHash string, sigURL st
 				return fmt.Errorf("error writing to hash: %w", ew)
 			}
 			progress := float32(verified) / float32(totalSize)
-			if progress-*verifyProgress >= 0.01 {
+			if verifyProgress != nil && progress-*verifyProgress >= 0.01 {
 				*verifyProgress = progress
 				triggerOTAStateUpdate()
 			}
@@ -1280,18 +1291,10 @@ func verifyFile(ctx context.Context, path string, expectedHash string, sigURL st
 	}
 
 	hashSum := hash.Sum(nil)
-	scopedLogger.Info().Str("path", path).Str("hash", hex.EncodeToString(hashSum)).Msg("SHA256 hash of")
+	scopedLogger.Info().Str("path", unverifiedPath).Str("hash", hex.EncodeToString(hashSum)).Msg("SHA256 hash of")
 
 	if hex.EncodeToString(hashSum) != expectedHash {
 		return fmt.Errorf("hash mismatch: %x != %s", hashSum, expectedHash)
-	}
-
-	if err := os.Rename(unverifiedPath, path); err != nil {
-		return fmt.Errorf("error renaming file: %w", err)
-	}
-
-	if err := os.Chmod(path, 0o755); err != nil {
-		return fmt.Errorf("error making file executable: %w", err)
 	}
 
 	return nil
@@ -1327,11 +1330,12 @@ var otaState = OTAState{}
 
 func triggerOTAStateUpdate() {
 	go func() {
-		if currentSession == nil {
+		session := currentSession.Load()
+		if session == nil {
 			logger.Info().Msg("No active RPC session, skipping update state update")
 			return
 		}
-		writeJSONRPCEvent("otaState", otaState, currentSession)
+		writeJSONRPCEvent("otaState", otaState, session)
 	}()
 }
 
@@ -1379,9 +1383,9 @@ func cleanupStaleLocalPackageOnStartup() {
 
 func TryUpdate(ctx context.Context, deviceId string) error {
 	if !otaUploadMutex.TryLock() {
-		return fmt.Errorf("upload in progress, cannot start update")
+		return fmt.Errorf("another firmware operation is already in progress")
 	}
-	otaUploadMutex.Unlock()
+	defer otaUploadMutex.Unlock()
 
 	scopedLogger := otaLogger.With().
 		Str("deviceId", deviceId).
@@ -1459,6 +1463,7 @@ func TryUpdate(ctx context.Context, deviceId string) error {
 			remote.AppHash,
 			remote.AppSigUrl,
 			&otaState.AppVerificationProgress,
+			&otaState.AppSignatureVerified,
 			&scopedLogger,
 		)
 		if err != nil {
@@ -1470,7 +1475,7 @@ func TryUpdate(ctx context.Context, deviceId string) error {
 		verifyFinished := time.Now()
 		otaState.AppVerifiedAt = &verifyFinished
 		otaState.AppVerificationProgress = 1
-		otaState.AppSignatureVerified = strings.TrimSpace(remote.AppSigUrl) != ""
+		otaState.AppSignatureMissing = !otaState.AppSignatureVerified
 		otaState.AppUpdatedAt = &verifyFinished
 		otaState.AppUpdateProgress = 1
 		triggerOTAStateUpdate()
@@ -1498,6 +1503,7 @@ func TryUpdate(ctx context.Context, deviceId string) error {
 				&otaState.SystemVerificationProgress,
 				remote.SystemSigUrl,
 				remote.SystemHash,
+				&otaState.SystemSignatureVerified,
 				&scopedLogger,
 			)
 			if err != nil {
@@ -1522,7 +1528,7 @@ func TryUpdate(ctx context.Context, deviceId string) error {
 				return err
 			}
 
-			err = verifyFile(ctx, systemZipPath, remote.SystemHash, remote.SystemSigUrl, &otaState.SystemVerificationProgress, &scopedLogger)
+			err = verifyFile(ctx, systemZipPath, remote.SystemHash, remote.SystemSigUrl, &otaState.SystemVerificationProgress, &otaState.SystemSignatureVerified, &scopedLogger)
 			if err != nil {
 				otaState.Error = fmt.Sprintf("Error preparing system update archive: %v", err)
 				scopedLogger.Error().Err(err).Msg("Error preparing system update archive")
@@ -1546,7 +1552,7 @@ func TryUpdate(ctx context.Context, deviceId string) error {
 		verifyFinished := time.Now()
 		otaState.SystemVerifiedAt = &verifyFinished
 		otaState.SystemVerificationProgress = 1
-		otaState.SystemSignatureVerified = strings.TrimSpace(remote.SystemSigUrl) != ""
+		otaState.SystemSignatureMissing = !otaState.SystemSignatureVerified
 		triggerOTAStateUpdate()
 
 		scopedLogger.Info().Msg("Starting rk_ota command")
@@ -1792,6 +1798,11 @@ type SignatureUpdateResult struct {
 }
 
 func UpdateSignatures(ctx context.Context) (*SignatureUpdateResult, error) {
+	if !otaUploadMutex.TryLock() {
+		return nil, fmt.Errorf("another firmware operation is already in progress")
+	}
+	defer otaUploadMutex.Unlock()
+
 	result := &SignatureUpdateResult{}
 
 	remoteMetadata, err := fetchUpdateMetadata(ctx, "")
@@ -1885,7 +1896,10 @@ func streamMultipartUploadToFile(r *http.Request, fieldName string, targetPath s
 }
 
 func handleOTAUploadHttp(c *gin.Context) {
-	otaUploadMutex.Lock()
+	if !otaUploadMutex.TryLock() {
+		c.JSON(http.StatusConflict, gin.H{"error": "Another firmware operation is already in progress"})
+		return
+	}
 	defer otaUploadMutex.Unlock()
 
 	updateType := c.Query("type")
@@ -1958,7 +1972,10 @@ func handleOTAUploadHttp(c *gin.Context) {
 }
 
 func handleLocalPackageUploadHttp(c *gin.Context) {
-	otaUploadMutex.Lock()
+	if !otaUploadMutex.TryLock() {
+		c.JSON(http.StatusConflict, gin.H{"error": "Another firmware operation is already in progress"})
+		return
+	}
 	defer otaUploadMutex.Unlock()
 
 	// Check if update is in progress
@@ -2055,6 +2072,22 @@ func tryLocalUpdate(ctx context.Context, scopedLogger *zerolog.Logger) error {
 		return fmt.Errorf("failed to get package info: %w", err)
 	}
 
+	if info == nil || (!info.HasApp && !info.HasSystem) {
+		return fmt.Errorf("no local firmware package is available")
+	}
+
+	systemPath := filepath.Join(pkgDir, "update_system.zip")
+	if info.HasSystem {
+		verified, err := verifyLocalFirmware(systemPath, systemPath, scopedLogger)
+		if err != nil {
+			otaState.Error = fmt.Sprintf("Failed to verify system update: %v", err)
+			triggerOTAStateUpdate()
+			return err
+		}
+		otaState.SystemSignatureVerified = verified
+		otaState.SystemSignatureMissing = !verified
+	}
+
 	scopedLogger.Info().
 		Str("appVersion", info.AppVersion).
 		Str("systemVersion", info.SystemVersion).
@@ -2072,6 +2105,7 @@ func tryLocalUpdate(ctx context.Context, scopedLogger *zerolog.Logger) error {
 
 		appBinPath := "/userdata/picokvm/bin/kvm_app"
 		appBinUnverifiedPath := appBinPath + ".unverified"
+		defer os.Remove(appBinUnverifiedPath)
 
 		// Stage the new binary at a temporary path before atomically replacing the running app.
 		if err := copyFile(appPath, appBinUnverifiedPath); err != nil {
@@ -2089,15 +2123,14 @@ func tryLocalUpdate(ctx context.Context, scopedLogger *zerolog.Logger) error {
 		otaState.AppDownloadProgress = 1
 		triggerOTAStateUpdate()
 
-		// Verify hash if sha256 file exists
-		hashPath := filepath.Join(pkgDir, "kvm_app.sha256")
-		if _, err := os.Stat(hashPath); err == nil {
-			if err := verifyLocalPackageHash(appBinUnverifiedPath, hashPath, scopedLogger); err != nil {
-				otaState.Error = fmt.Sprintf("Failed to verify app hash: %v", err)
-				triggerOTAStateUpdate()
-				return err
-			}
+		verified, err := verifyLocalFirmware(appBinUnverifiedPath, appPath, scopedLogger)
+		if err != nil {
+			otaState.Error = fmt.Sprintf("Failed to verify app: %v", err)
+			triggerOTAStateUpdate()
+			return err
 		}
+		otaState.AppSignatureVerified = verified
+		otaState.AppSignatureMissing = !verified
 
 		otaState.AppVerificationProgress = 1
 		now := time.Now()
@@ -2117,7 +2150,6 @@ func tryLocalUpdate(ctx context.Context, scopedLogger *zerolog.Logger) error {
 
 	// Process System update
 	if info.HasSystem {
-		systemPath := filepath.Join(pkgDir, "update_system.zip")
 		scopedLogger.Info().Str("path", systemPath).Msg("Processing local system update")
 
 		otaState.SystemUpdatePending = true
@@ -2135,16 +2167,6 @@ func tryLocalUpdate(ctx context.Context, scopedLogger *zerolog.Logger) error {
 
 		otaState.SystemDownloadProgress = 1
 		triggerOTAStateUpdate()
-
-		// Verify hash if sha256 file exists
-		hashPath := filepath.Join(pkgDir, "update_system.zip.sha256")
-		if _, err := os.Stat(hashPath); err == nil {
-			if err := verifyLocalPackageHash(systemPath, hashPath, scopedLogger); err != nil {
-				otaState.Error = fmt.Sprintf("Failed to verify system hash: %v", err)
-				triggerOTAStateUpdate()
-				return err
-			}
-		}
 
 		otaState.SystemVerificationProgress = 1
 		now := time.Now()
@@ -2189,6 +2211,25 @@ func tryLocalUpdate(ctx context.Context, scopedLogger *zerolog.Logger) error {
 	}
 	os.Exit(0)
 	return nil
+}
+
+func verifyLocalFirmware(firmwarePath, packagePath string, scopedLogger *zerolog.Logger) (bool, error) {
+	sigPath := packagePath + ".sig"
+	requireSignature := strings.TrimSpace(builtOtaPublicKey) != ""
+	present, err := verifyFileSignature(firmwarePath, sigPath, scopedLogger)
+	if err != nil {
+		return false, err
+	}
+	if requireSignature && !present {
+		return false, fmt.Errorf("missing required signature for %s", filepath.Base(packagePath))
+	}
+	hashPath := packagePath + ".sha256"
+	if _, err := os.Stat(hashPath); !present || !os.IsNotExist(err) {
+		if err := verifyLocalPackageHash(firmwarePath, hashPath, scopedLogger); err != nil {
+			return false, err
+		}
+	}
+	return present, nil
 }
 
 func extractAppFromZip(zipPath string, targetPath string) error {

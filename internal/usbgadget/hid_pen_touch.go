@@ -224,10 +224,9 @@ func penTouchReport(reportID byte, payload []byte) []byte {
 }
 
 func (u *UsbGadget) penTouchWriteHidFile(data []byte) error {
-	if !u.enabledDevices.AbsoluteMouse {
-		// The pen/touch function rides with the absolute mouse one: it is part of the
-		// composition whenever the absolute pointer is, so switching the pointer off
-		// removes this node as well.
+	if !u.HasPenTouch() {
+		// The pen/touch function rides with the absolute mouse one whenever UDC
+		// endpoint budget permits (neither USB audio nor MTP is active).
 		return ErrHIDDeviceNotConfigured
 	}
 	if u.penTouchHidFile == nil {
@@ -359,8 +358,8 @@ func (u *UsbGadget) TouchReport(contacts []TouchContact) error {
 }
 
 // HasPenTouch reports whether the pen/touch HID function is part of the gadget.
-// It follows the absolute mouse function, which is the one that carries the
-// pointer these collections drive.
+// It follows the absolute mouse function whenever neither USB audio nor MTP is
+// active, because the RV1106 UDC has 5 IN endpoints and cannot bind 6 at once.
 func (u *UsbGadget) HasPenTouch() bool {
-	return u.enabledDevices.AbsoluteMouse
+	return u.enabledDevices.AbsoluteMouse && !u.enabledDevices.Audio && !u.enabledDevices.Mtp
 }

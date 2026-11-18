@@ -17,8 +17,7 @@ import { DEVICE_API } from "@/ui.config";
 import { SelectMenuBasic } from "../SelectMenuBasic";
 import api from "../../api";
 import { LinkButton } from "../Button";
-import enJSON from '../../locales/en.json'
-import zhJSON from '../../locales/zh.json'
+import { getLocaleMessages } from '../../locales'
 
 interface NavbarProps {
   isLoggedIn: boolean;
@@ -59,6 +58,7 @@ export default function DashboardNavbar({
   
   const LangOptions = [
     { value: "en", label: "English"},
+    { value: "pt", label: "Português"},
     { value: "zh", label: "中文"},
   ];
   
@@ -67,11 +67,11 @@ export default function DashboardNavbar({
 
   const handleLangChange = (lang: string) => {
       setLanguage(lang)
-      setCurrentLang(lang, lang === 'en' ? enJSON : zhJSON)
+      setCurrentLang(lang, getLocaleMessages(lang))
   };
 
   useEffect(() => {
-    setCurrentLang(language, language === 'en' ? enJSON : zhJSON)
+    setCurrentLang(language, getLocaleMessages(language))
   }, [language, setCurrentLang])
 
   // for testing

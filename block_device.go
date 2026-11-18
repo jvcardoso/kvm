@@ -3,6 +3,7 @@ package kvm
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"time"
@@ -12,37 +13,46 @@ import (
 )
 
 type remoteImageBackend struct {
+	state  *VirtualMediaState
+	reader *httpImageReader
 }
 
 func (r remoteImageBackend) ReadAt(p []byte, off int64) (n int, err error) {
-	virtualMediaStateMutex.RLock()
-	logger.Debug().Interface("currentVirtualMediaState", currentVirtualMediaState).Msg("currentVirtualMediaState")
-	logger.Debug().Int64("read size", int64(len(p))).Int64("off", off).Msg("read size and off")
-	if currentVirtualMediaState == nil {
+	state, reader := r.state, r.reader
+	if state == nil {
 		return 0, errors.New("image not mounted")
 	}
-	source := currentVirtualMediaState.Source
-	mountedImageSize := currentVirtualMediaState.Size
-	virtualMediaStateMutex.RUnlock()
+	if off < 0 {
+		return 0, errors.New("negative disk read offset")
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if off >= state.Size {
+		return 0, io.EOF
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	readLen := int64(len(p))
-	if off+readLen > mountedImageSize {
-		readLen = mountedImageSize - off
-	}
-	var data []byte
-	switch source {
+	readLen := min(int64(len(p)), state.Size-off)
+	switch state.Source {
 	case WebRTC:
-		data, err = webRTCDiskReader.Read(ctx, off, readLen)
-		if err != nil {
-			return 0, err
-		}
+		data, err := webRTCDiskReader.readMounted(ctx, state, off, readLen)
 		n = copy(p, data)
-		return n, nil
+		if err == nil && n < len(p) {
+			err = io.EOF
+		}
+		return n, err
 	case HTTP:
-		return httpRangeReader.ReadAt(p, off)
+		if reader == nil {
+			return 0, errors.New("HTTP image reader unavailable")
+		}
+		n, _, err = reader.readRange(ctx, p[:readLen], off)
+		if err == nil && n < len(p) {
+			err = io.EOF
+		}
+		return n, err
 	default:
 		return 0, errors.New("unknown image source")
 	}
@@ -53,12 +63,10 @@ func (r remoteImageBackend) WriteAt(p []byte, off int64) (n int, err error) {
 }
 
 func (r remoteImageBackend) Size() (int64, error) {
-	virtualMediaStateMutex.Lock()
-	defer virtualMediaStateMutex.Unlock()
-	if currentVirtualMediaState == nil {
+	if r.state == nil {
 		return 0, errors.New("no virtual media state")
 	}
-	return currentVirtualMediaState.Size, nil
+	return r.state.Size, nil
 }
 
 func (r remoteImageBackend) Sync() error {
@@ -69,6 +77,7 @@ const nbdSocketPath = "/var/run/nbd.socket"
 const nbdDevicePath = "/dev/nbd0"
 
 type NBDDevice struct {
+	backend    remoteImageBackend
 	listener   net.Listener
 	serverConn net.Conn
 	clientConn net.Conn
@@ -77,8 +86,8 @@ type NBDDevice struct {
 	l *zerolog.Logger
 }
 
-func NewNBDDevice() *NBDDevice {
-	return &NBDDevice{}
+func NewNBDDevice(backend remoteImageBackend) *NBDDevice {
+	return &NBDDevice{backend: backend}
 }
 
 func (d *NBDDevice) Start() error {
@@ -104,8 +113,7 @@ func (d *NBDDevice) Start() error {
 	// Remove the socket file if it already exists
 	if _, err := os.Stat(nbdSocketPath); err == nil {
 		if err := os.Remove(nbdSocketPath); err != nil {
-			d.l.Error().Err(err).Msg("failed to remove existing socket file")
-			os.Exit(1)
+			return err
 		}
 	}
 
@@ -135,7 +143,7 @@ func (d *NBDDevice) runServerConn() {
 			{
 				Name:        "kvm",
 				Description: "",
-				Backend:     &remoteImageBackend{},
+				Backend:     &d.backend,
 			},
 		},
 		&server.Options{

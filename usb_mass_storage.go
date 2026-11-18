@@ -19,7 +19,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
-	"github.com/psanford/httpreadat"
 
 	"kvm/resource"
 )
@@ -84,6 +83,9 @@ func forceEjectMassStorageLun() error {
 }
 
 func setMassStorageMode(cdrom bool) error {
+	if gadget == nil {
+		return errors.New("USB gadget is not initialized")
+	}
 	mode := "0"
 	if cdrom {
 		mode = "1"
@@ -99,11 +101,6 @@ func setMassStorageMode(cdrom bool) error {
 	}
 
 	return gadget.UpdateGadgetConfig()
-}
-
-func onDiskMessage(msg webrtc.DataChannelMessage) {
-	logger.Info().Int("len", len(msg.Data)).Msg("Disk Message")
-	diskReadChan <- msg.Data
 }
 
 func mountImage(imagePath string) error {
@@ -123,6 +120,9 @@ func mountImage(imagePath string) error {
 }
 
 var nbdDevice *NBDDevice
+
+// Serializes gadget operations while NBD callbacks can read media state.
+var virtualMediaOperationMutex sync.Mutex
 
 const imagesFolder = "/userdata/picokvm/share"
 const SDImagesFolder = "/mnt/sdcard"
@@ -187,13 +187,33 @@ func getMassStorageCDROMEnabled() (bool, error) {
 }
 
 type VirtualMediaUrlInfo struct {
-	Usable bool
-	Reason string //only populated if Usable is false
-	Size   int64
+	Usable bool   `json:"usable"`
+	Reason string `json:"reason,omitempty"` // only populated if Usable is false
+	Size   int64  `json:"size"`
 }
 
-func rpcCheckMountUrl(url string) (*VirtualMediaUrlInfo, error) {
-	return nil, errors.New("not implemented")
+func rpcCheckMountUrl(rawURL string) (*VirtualMediaUrlInfo, error) {
+	reader, err := openHTTPImage(rawURL)
+	if err != nil {
+		return &VirtualMediaUrlInfo{Usable: false, Reason: err.Error()}, nil
+	}
+	return &VirtualMediaUrlInfo{Usable: true, Size: reader.size}, nil
+}
+
+// waitNBDDeviceReady polls /sys/block/nbd0/size until the kernel reports a non-zero
+// block count or the timeout expires.
+func waitNBDDeviceReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile("/sys/block/nbd0/size"); err == nil {
+			val := strings.TrimSpace(string(data))
+			if val != "" && val != "0" {
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return errors.New("timed out waiting for NBD device")
 }
 
 type VirtualMediaSource string
@@ -219,6 +239,7 @@ type VirtualMediaState struct {
 	URL      string             `json:"url,omitempty"`
 	Path     string             `json:"path,omitempty"`
 	Size     int64              `json:"size"`
+	webRTC   *webRTCMediaMount
 }
 
 var currentVirtualMediaState *VirtualMediaState
@@ -275,32 +296,25 @@ func rpcUnmountImage() error {
 // for user-initiated unmounts; internal paths (USB reinit, session close, gadget
 // device change) must keep the configured auto-mount image.
 func unmountImage(clearAutoMount bool) error {
-	virtualMediaStateMutex.Lock()
+	return unmountImageForSession(clearAutoMount, nil, nil)
+}
 
-	unmounted := currentVirtualMediaState
-
-	detachErr := detachMassStorageImage()
-	needGadgetRebuild := detachErr != nil && isMassStorageBusy(detachErr)
-	if detachErr != nil && !needGadgetRebuild {
-		virtualMediaStateMutex.Unlock()
-		logger.Warn().Err(detachErr).Msg("Remove Mass Storage Image Error")
-		return fmt.Errorf("failed to detach mass storage image: %w", detachErr)
+func unmountImageForSession(clearAutoMount bool, owner *Session, channel *webrtc.DataChannel) error {
+	virtualMediaOperationMutex.Lock()
+	if owner != nil {
+		state, _ := rpcGetVirtualMediaState()
+		if !ownsWebRTCMedia(state, owner, channel) {
+			virtualMediaOperationMutex.Unlock()
+			return nil
+		}
 	}
-
-	// Clear the state before any gadget rebuild: rpcReinitializeUsbGadget unmounts a
-	// mounted image by calling back into this function, and this mutex is not
-	// reentrant, so leaving the state set would deadlock on itself.
-	currentVirtualMediaState = nil
-	clearPersistedVirtualMediaState()
-	virtualMediaStateMutex.Unlock()
-
-	if nbdDevice != nil {
-		nbdDevice.Close()
-		nbdDevice = nil
-	}
-
-	if clearAutoMount {
+	unmounted, needGadgetRebuild, err := detachVirtualMedia(true)
+	if err == nil && clearAutoMount {
 		clearAutoMountForUnmountedImage(unmounted)
+	}
+	virtualMediaOperationMutex.Unlock()
+	if err != nil {
+		return err
 	}
 
 	if !needGadgetRebuild {
@@ -352,8 +366,6 @@ func unmountImage(clearAutoMount bool) error {
 	logger.Info().Msg("USB gadget rebuilt after releasing the mass storage medium")
 	return nil
 }
-
-var httpRangeReader *httpreadat.RangeReader
 
 func getInitialVirtualMediaState() (*VirtualMediaState, error) {
 	cdromEnabled, err := getMassStorageCDROMEnabled()
@@ -408,7 +420,7 @@ func setInitialVirtualMediaState() error {
 	// system_info.img is provided through auto-mount only. If the user disabled
 	// auto-mount (auto_mount_image: null) the gadget may still expose it after an
 	// app restart, so detach it instead of resurrecting it.
-	if initialState != nil && initialState.Filename == systemInfoImageFilename && config.AutoMountImage == nil {
+	if initialState != nil && initialState.Filename == systemInfoImageFilename && configSnapshot().AutoMountImage == nil {
 		logger.Info().Msg("auto-mount disabled, detaching system_info.img from the gadget")
 		if err := setMassStorageImage("\n"); err != nil {
 			logger.Warn().Err(err).Msg("failed to detach system_info.img from the gadget")
@@ -428,66 +440,50 @@ func setInitialVirtualMediaState() error {
 // clearAutoMountForUnmountedImage clears the auto-mount entry when it points to
 // the image the user just unmounted.
 func clearAutoMountForUnmountedImage(unmounted *VirtualMediaState) {
-	if unmounted == nil || config.AutoMountImage == nil {
+	if !matchesAutoMount(configSnapshot().AutoMountImage, unmounted) {
 		return
 	}
-
-	source := "kvm"
-	if unmounted.Source == SDStorage {
-		source = "sd"
-	}
-
-	if config.AutoMountImage.Filename != unmounted.Filename || config.AutoMountImage.Source != source {
-		return
-	}
-
-	config.AutoMountImage = nil
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		if matchesAutoMount(next.AutoMountImage, unmounted) {
+			next.AutoMountImage = nil
+		}
+	}); err != nil {
 		logger.Warn().Err(err).Msg("failed to clear auto-mount config after unmount")
 	}
 }
 
-// clearPersistedAutoMountState drops the persisted virtual media entry when it
-// points to the image configured for auto-mount, so that disabling auto-mount also
-// stops the image from being remounted after a restart. Callers persist the config.
-func clearPersistedAutoMountState(autoMount *AutoMountImageConfig, persisted *VirtualMediaState) bool {
-	if autoMount == nil || persisted == nil {
+func matchesAutoMount(autoMount *AutoMountImageConfig, media *VirtualMediaState) bool {
+	if autoMount == nil || media == nil {
 		return false
 	}
-
 	source := "kvm"
-	if persisted.Source == SDStorage {
+	if media.Source == SDStorage {
 		source = "sd"
 	}
-
-	if persisted.Filename != autoMount.Filename || source != autoMount.Source {
-		return false
-	}
-
-	config.PersistedVirtualMediaState = nil
-	return true
+	return media.Filename == autoMount.Filename && source == autoMount.Source
 }
 
 func persistVirtualMediaState(state *VirtualMediaState) {
-	config.PersistedVirtualMediaState = state
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.PersistedVirtualMediaState = state
+	}); err != nil {
 		logger.Error().Err(err).Msg("failed to persist virtual media state")
 	}
 }
 
 func clearPersistedVirtualMediaState() {
-	config.PersistedVirtualMediaState = nil
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.PersistedVirtualMediaState = nil
+	}); err != nil {
 		logger.Error().Err(err).Msg("failed to clear persisted virtual media state")
 	}
 }
 
 func remountPersistedVirtualMediaState() {
-	if config.PersistedVirtualMediaState == nil {
+	state := configSnapshot().PersistedVirtualMediaState
+	if state == nil {
 		return
 	}
-
-	state := config.PersistedVirtualMediaState
 
 	// system_info.img is tracked by auto_mount_image only. Its persisted entry must
 	// not resurrect it: when the user disabled auto-mount (auto_mount_image: null)
@@ -519,83 +515,105 @@ func remountPersistedVirtualMediaState() {
 	}
 }
 
-func rpcMountWithHTTP(url string, mode VirtualMediaMode) error {
-	virtualMediaStateMutex.Lock()
-	if currentVirtualMediaState != nil {
-		virtualMediaStateMutex.Unlock()
-		return fmt.Errorf("another virtual media is already mounted")
+// detachVirtualMedia runs with virtualMediaOperationMutex held. Keep the state
+// available to NBD while the gadget detaches and waits for outstanding reads.
+func detachVirtualMedia(allowGadgetRebuild bool) (*VirtualMediaState, bool, error) {
+	unmounted, _ := rpcGetVirtualMediaState()
+	err := detachMassStorageImage()
+	needGadgetRebuild := err != nil && allowGadgetRebuild && isMassStorageBusy(err)
+	if err != nil && !needGadgetRebuild {
+		return nil, false, fmt.Errorf("failed to detach mass storage image: %w", err)
 	}
-	httpRangeReader = httpreadat.New(url)
-	n, err := httpRangeReader.Size()
+	if unmounted != nil && unmounted.webRTC != nil {
+		unmounted.webRTC.cancel()
+	}
+	if nbdDevice != nil {
+		nbdDevice.Close()
+		nbdDevice = nil
+	}
+	virtualMediaStateMutex.Lock()
+	currentVirtualMediaState = nil
+	virtualMediaStateMutex.Unlock()
+	clearPersistedVirtualMediaState()
+	return unmounted, needGadgetRebuild, nil
+}
+
+func rpcMountWithHTTP(url string, mode VirtualMediaMode) error {
+	reader, err := openHTTPImage(url)
 	if err != nil {
-		virtualMediaStateMutex.Unlock()
 		return fmt.Errorf("failed to use http url: %w", err)
 	}
-	logger.Info().Str("url", url).Int64("size", n).Msg("using remote url")
+	return mountRemoteImage(&VirtualMediaState{Source: HTTP, Mode: mode, URL: reader.url, Size: reader.size}, reader)
+}
 
-	if err := setMassStorageMode(mode == CDROM); err != nil {
-		return fmt.Errorf("failed to set mass storage mode: %w", err)
-	}
-
-	currentVirtualMediaState = &VirtualMediaState{
-		Source: HTTP,
-		Mode:   mode,
-		URL:    url,
-		Size:   n,
-	}
-	virtualMediaStateMutex.Unlock()
-
-	logger.Debug().Msg("Starting nbd device")
-	nbdDevice = NewNBDDevice()
-	err = nbdDevice.Start()
-	if err != nil {
-		logger.Warn().Err(err).Msg("failed to start nbd device")
-		return err
-	}
-	logger.Debug().Msg("nbd device started")
-	//TODO: replace by polling on block device having right size
-	time.Sleep(1 * time.Second)
-	err = setMassStorageImage("/dev/nbd0")
+func rpcMountWithWebRTC(owner *Session, filename string, size int64, mode VirtualMediaMode, generation string) error {
+	mount, err := newWebRTCMediaMount(owner, generation)
 	if err != nil {
 		return err
 	}
-	logger.Info().Msg("usb mass storage mounted")
+	state := &VirtualMediaState{Source: WebRTC, Mode: mode, Filename: filename, Size: size, webRTC: mount}
+	if err := mountRemoteImage(state, nil); err != nil {
+		mount.cancel()
+		return err
+	}
 	return nil
 }
 
-func rpcMountWithWebRTC(filename string, size int64, mode VirtualMediaMode) error {
-	virtualMediaStateMutex.Lock()
-	if currentVirtualMediaState != nil {
-		virtualMediaStateMutex.Unlock()
-		return fmt.Errorf("another virtual media is already mounted")
-	}
-	currentVirtualMediaState = &VirtualMediaState{
-		Source:   WebRTC,
-		Mode:     mode,
-		Filename: filename,
-		Size:     size,
-	}
-	virtualMediaStateMutex.Unlock()
+func ownsWebRTCMedia(state *VirtualMediaState, owner *Session, channel *webrtc.DataChannel) bool {
+	return state != nil && state.webRTC != nil && state.webRTC.owner == owner &&
+		(channel == nil || state.webRTC.channel == channel)
+}
 
-	if err := setMassStorageMode(mode == CDROM); err != nil {
+func invalidateWebRTCMedia(owner *Session, channel *webrtc.DataChannel) {
+	state, _ := rpcGetVirtualMediaState()
+	if ownsWebRTCMedia(state, owner, channel) {
+		state.webRTC.cancel()
+	}
+}
+
+func mountRemoteImage(state *VirtualMediaState, reader *httpImageReader) (err error) {
+	if state.Size <= 0 {
+		return errors.New("invalid remote image size")
+	}
+	virtualMediaOperationMutex.Lock()
+	defer virtualMediaOperationMutex.Unlock()
+	if mounted, _ := rpcGetVirtualMediaState(); mounted != nil {
+		return errors.New("another virtual media is already mounted")
+	}
+	if err := setMassStorageMode(state.Mode == CDROM); err != nil {
 		return fmt.Errorf("failed to set mass storage mode: %w", err)
 	}
 
-	logger.Debug().Interface("currentVirtualMediaState", currentVirtualMediaState).Msg("currentVirtualMediaState")
-	logger.Debug().Msg("Starting nbd device")
-	nbdDevice = NewNBDDevice()
-	err := nbdDevice.Start()
-	if err != nil {
-		logger.Warn().Err(err).Msg("failed to start nbd device")
+	virtualMediaStateMutex.Lock()
+	if state.webRTC != nil && (currentSession.Load() != state.webRTC.owner || state.webRTC.owner.diskChannel.Load() != state.webRTC.channel) {
+		virtualMediaStateMutex.Unlock()
+		return errors.New("WebRTC media session is no longer active")
+	}
+	currentVirtualMediaState = state
+	virtualMediaStateMutex.Unlock()
+
+	device := NewNBDDevice(remoteImageBackend{state: state, reader: reader})
+	defer func() {
+		if err != nil {
+			if state.webRTC != nil {
+				state.webRTC.cancel()
+			}
+			device.Close()
+			virtualMediaStateMutex.Lock()
+			currentVirtualMediaState = nil
+			virtualMediaStateMutex.Unlock()
+		}
+	}()
+	if err := device.Start(); err != nil {
+		return fmt.Errorf("failed to start NBD device: %w", err)
+	}
+	if err := waitNBDDeviceReady(2 * time.Second); err != nil {
 		return err
 	}
-	logger.Debug().Msg("nbd device started")
-	//TODO: replace by polling on block device having right size
-	time.Sleep(1 * time.Second)
-	err = setMassStorageImage("/dev/nbd0")
-	if err != nil {
+	if err := setMassStorageImage(nbdDevicePath); err != nil {
 		return err
 	}
+	nbdDevice = device
 	logger.Info().Msg("usb mass storage mounted")
 	return nil
 }
@@ -606,27 +624,19 @@ func rpcMountWithStorage(filename string, mode VirtualMediaMode) error {
 		return err
 	}
 
-	virtualMediaStateMutex.Lock()
-	defer virtualMediaStateMutex.Unlock()
-	if currentVirtualMediaState != nil {
-		// Auto-unmount before mounting new image
-		logger.Info().Msg("auto-unmounting current image before mounting new one")
-		if err := setMassStorageImage("\n"); err != nil {
-			logger.Warn().Err(err).Msg("failed to unmount current image")
-		}
-		time.Sleep(500 * time.Millisecond)
-		if nbdDevice != nil {
-			nbdDevice.Close()
-			nbdDevice = nil
-		}
-		currentVirtualMediaState = nil
-		clearPersistedVirtualMediaState()
-	}
+	virtualMediaOperationMutex.Lock()
+	defer virtualMediaOperationMutex.Unlock()
 
 	fullPath := filepath.Join(imagesFolder, filename)
 	fileInfo, err := os.Stat(fullPath)
 	if err != nil {
 		return fmt.Errorf("[rpcMountWithStorage]failed to get file info: %w", err)
+	}
+
+	if mounted, _ := rpcGetVirtualMediaState(); mounted != nil {
+		if _, _, err := detachVirtualMedia(false); err != nil {
+			return err
+		}
 	}
 
 	if err := setMassStorageMode(mode == CDROM); err != nil {
@@ -637,17 +647,20 @@ func rpcMountWithStorage(filename string, mode VirtualMediaMode) error {
 	if err != nil {
 		return fmt.Errorf("failed to set mass storage image: %w", err)
 	}
-	currentVirtualMediaState = &VirtualMediaState{
+	state := &VirtualMediaState{
 		Source:   Storage,
 		Mode:     mode,
 		Filename: filename,
 		Path:     fullPath,
 		Size:     fileInfo.Size(),
 	}
+	virtualMediaStateMutex.Lock()
+	currentVirtualMediaState = state
+	virtualMediaStateMutex.Unlock()
 	// system_info.img is persisted through auto_mount_image only; a persisted entry
 	// would bypass the explicit null "disabled" marker after a restart.
 	if filename != systemInfoImageFilename {
-		persistVirtualMediaState(currentVirtualMediaState)
+		persistVirtualMediaState(state)
 	}
 	return nil
 }
@@ -658,27 +671,19 @@ func rpcMountWithSDStorage(filename string, mode VirtualMediaMode) error {
 		return err
 	}
 
-	virtualMediaStateMutex.Lock()
-	defer virtualMediaStateMutex.Unlock()
-	if currentVirtualMediaState != nil {
-		// Auto-unmount before mounting new image
-		logger.Info().Msg("auto-unmounting current image before mounting new one")
-		if err := setMassStorageImage("\n"); err != nil {
-			logger.Warn().Err(err).Msg("failed to unmount current image")
-		}
-		time.Sleep(500 * time.Millisecond)
-		if nbdDevice != nil {
-			nbdDevice.Close()
-			nbdDevice = nil
-		}
-		currentVirtualMediaState = nil
-		clearPersistedVirtualMediaState()
-	}
+	virtualMediaOperationMutex.Lock()
+	defer virtualMediaOperationMutex.Unlock()
 
 	fullPath := filepath.Join(SDImagesFolder, filename)
 	fileInfo, err := os.Stat(fullPath)
 	if err != nil {
 		return fmt.Errorf("[rpcMountWithSDStorage]failed to get file info: %w", err)
+	}
+
+	if mounted, _ := rpcGetVirtualMediaState(); mounted != nil {
+		if _, _, err := detachVirtualMedia(false); err != nil {
+			return err
+		}
 	}
 
 	if err := setMassStorageMode(mode == CDROM); err != nil {
@@ -689,14 +694,17 @@ func rpcMountWithSDStorage(filename string, mode VirtualMediaMode) error {
 	if err != nil {
 		return fmt.Errorf("failed to set mass storage image: %w", err)
 	}
-	currentVirtualMediaState = &VirtualMediaState{
+	state := &VirtualMediaState{
 		Source:   SDStorage,
 		Mode:     mode,
 		Filename: filename,
 		Path:     fullPath,
 		Size:     fileInfo.Size(),
 	}
-	persistVirtualMediaState(currentVirtualMediaState)
+	virtualMediaStateMutex.Lock()
+	currentVirtualMediaState = state
+	virtualMediaStateMutex.Unlock()
+	persistVirtualMediaState(state)
 	return nil
 }
 
@@ -740,7 +748,7 @@ func rpcListStorageFiles() (*StorageFiles, error) {
 
 	storageFiles := make([]StorageFile, 0)
 	for _, file := range files {
-		if file.IsDir() {
+		if file.IsDir() || isProtectedStorageFilename(file.Name()) {
 			continue
 		}
 
@@ -759,13 +767,22 @@ func rpcListStorageFiles() (*StorageFiles, error) {
 	return &StorageFiles{Files: storageFiles}, nil
 }
 
+func isProtectedStorageFilename(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" || strings.HasPrefix(trimmed, ".") {
+		return true
+	}
+	return strings.EqualFold(trimmed, "kvm_config.json") ||
+		strings.EqualFold(trimmed, "kvm_config.json.corrupt")
+}
+
 func sanitizeFilename(filename string) (string, error) {
 	cleanPath := filepath.Clean(filename)
 	if filepath.IsAbs(cleanPath) || strings.Contains(cleanPath, "..") {
 		return "", errors.New("invalid filename")
 	}
 	sanitized := filepath.Base(cleanPath)
-	if sanitized == "." || sanitized == string(filepath.Separator) {
+	if sanitized == "." || sanitized == string(filepath.Separator) || isProtectedStorageFilename(sanitized) {
 		return "", errors.New("invalid filename")
 	}
 	return sanitized, nil
@@ -789,9 +806,12 @@ func rpcDeleteStorageFile(filename string) error {
 	}
 
 	// Clear auto-mount config if the deleted file was set for auto-mount
-	if config.AutoMountImage != nil && config.AutoMountImage.Filename == sanitizedFilename && config.AutoMountImage.Source == "kvm" {
-		config.AutoMountImage = nil
-		if err := SaveConfig(); err != nil {
+	if media := configSnapshot().AutoMountImage; media != nil && media.Filename == sanitizedFilename && media.Source == "kvm" {
+		if err := updateConfig(func(next *Config) {
+			if next.AutoMountImage == media {
+				next.AutoMountImage = nil
+			}
+		}); err != nil {
 			usbLogger.Warn().Err(err).Msg("failed to clear auto-mount config after file deletion")
 		}
 	}
@@ -1169,7 +1189,7 @@ func rpcFormatSDStorage(confirm bool, fsType string) error {
 		return fmt.Errorf("failed to mount sdcard after format: %w: %s", mountErr, strings.TrimSpace(string(mountOut)))
 	}
 
-	SyncConfigSD(false)
+	exportConfigSD()
 
 	if err := updateMtp(true); err != nil {
 		return fmt.Errorf("failed to update mtp after formatting sd: %w", err)
@@ -1190,7 +1210,7 @@ func rpcListSDStorageFiles() (*StorageFiles, error) {
 
 	storageFiles := make([]StorageFile, 0)
 	for _, file := range files {
-		if file.IsDir() {
+		if file.IsDir() || isProtectedStorageFilename(file.Name()) {
 			continue
 		}
 
@@ -1227,9 +1247,12 @@ func rpcDeleteSDStorageFile(filename string) error {
 	}
 
 	// Clear auto-mount config if the deleted file was set for auto-mount
-	if config.AutoMountImage != nil && config.AutoMountImage.Filename == sanitizedFilename && config.AutoMountImage.Source == "sd" {
-		config.AutoMountImage = nil
-		if err := SaveConfig(); err != nil {
+	if media := configSnapshot().AutoMountImage; media != nil && media.Filename == sanitizedFilename && media.Source == "sd" {
+		if err := updateConfig(func(next *Config) {
+			if next.AutoMountImage == media {
+				next.AutoMountImage = nil
+			}
+		}); err != nil {
 			usbLogger.Warn().Err(err).Msg("failed to clear auto-mount config after file deletion")
 		}
 	}
@@ -1390,11 +1413,11 @@ usb_epout_path "/dev/ffs-mtp/ep2"
 usb_epint_path "/dev/ffs-mtp/ep3"
 usb_max_packet_size 0x200
 `,
-		config.UsbConfig.Manufacturer,
-		config.UsbConfig.Product,
-		config.UsbConfig.SerialNumber,
-		config.UsbConfig.VendorId,
-		config.UsbConfig.ProductId,
+		configSnapshot().UsbConfig.Manufacturer,
+		configSnapshot().UsbConfig.Product,
+		configSnapshot().UsbConfig.SerialNumber,
+		configSnapshot().UsbConfig.VendorId,
+		configSnapshot().UsbConfig.ProductId,
 	)
 
 	return os.WriteFile(umtprdConfPath, []byte(conf), 0644)
@@ -1404,7 +1427,7 @@ func updateMtp(withSD bool) error {
 	if err := writeUmtprdConfFile(withSD); err != nil {
 		logger.Error().Err(err).Msg("failed to write umtprd conf file")
 	}
-	if config.UsbDevices.Mtp {
+	if configSnapshot().UsbDevices.Mtp {
 		if err := gadget.UnbindUDC(); err != nil {
 			logger.Error().Err(err).Msg("failed to unbind gadget from UDC")
 		}
@@ -1420,10 +1443,11 @@ func updateMtp(withSD bool) error {
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("failed to exec binary: %w", err)
 		}
+		go func() { _ = cmd.Wait() }()
 
 		var lastErr error
 		for attempt := 0; attempt < 6; attempt++ {
-			if err := rpcSetUsbDevices(*config.UsbDevices); err == nil {
+			if err := rpcSetUsbDevices(*configSnapshot().UsbDevices); err == nil {
 				lastErr = nil
 				break
 			} else {

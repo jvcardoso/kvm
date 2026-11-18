@@ -90,7 +90,7 @@ export default function ImageManager({
   const [mountInProgress, setMountInProgress] = useState(false);
   const [autoMountImage, setAutoMountImage] = useState<{filename: string, source: string} | null>(null);
   const [storageSpace, setStorageSpace] = useState<StorageSpace | null>(null);
-  const { remoteVirtualMediaState, setRemoteVirtualMediaState } = useMountMediaStore();
+  const setRemoteVirtualMediaState = useMountMediaStore(state => state.setRemoteVirtualMediaState);
   const [sdMountStatus, setSDMountStatus] = useState<"ok" | "none" | "fail" | null>(storageType === 'sd' ? null : 'ok');
   const [loading, setLoading] = useState(false);
   const [uploadFile, setUploadFile] = useState<string | null>(null);
@@ -267,15 +267,18 @@ export default function ImageManager({
   const handleMountFile = useCallback(() => {
     if (!selectedFile) return;
 
+    const previousMedia = useMountMediaStore.getState().browserMedia;
     setMountInProgress(true);
-    send(mountApi, { filename: selectedFile, mode: usbMode }, async resp => {
+    send(mountApi, { filename: selectedFile, mode: usbMode }, resp => {
       if ("error" in resp) {
-        notifications.error(`Mount error: ${resp.error.message}`);
+        notifications.error(`Mount error: ${resp.error.data || resp.error.message}`);
         setMountInProgress(false);
         return;
       }
 
-      syncRemoteVirtualMediaState()
+      const media = useMountMediaStore.getState();
+      if (media.browserMedia === previousMedia) media.setBrowserMedia(null);
+      syncRemoteVirtualMediaState();
       setMountInProgress(false);
       if (onMountSuccess) {
         onMountSuccess();
@@ -283,7 +286,7 @@ export default function ImageManager({
         navigate("..");
       }
     });
-  }, [selectedFile, usbMode, send, mountApi, onMountSuccess, navigate]);
+  }, [selectedFile, usbMode, send, mountApi, onMountSuccess, navigate, syncRemoteVirtualMediaState]);
 
   const handleAutoMountChange = useCallback((enabled: boolean) => {
     if (!selectedFile) return;

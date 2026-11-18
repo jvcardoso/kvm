@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { accumulateScroll, clampWheelNotches } from "@/utils/touchScroll";
 
@@ -49,6 +49,7 @@ export const useTouchZoom = (
   containerRef: React.RefObject<HTMLDivElement>,
   gestureEnabled = true,
   onTouchScroll?: TouchScrollHandler,
+  onMultiTouchStart?: () => void,
 ) => {
   const localZoom = gestureEnabled;
   const localScroll = !gestureEnabled;
@@ -65,6 +66,9 @@ export const useTouchZoom = (
   const activeTouchPointers = useRef<Map<number, { x: number; y: number }>>(new Map());
   const initialPinchDistance = useRef<number | null>(null);
   const initialPinchScale = useRef<number>(1);
+  const pinchOrigin = useRef<{ x: number; y: number; tx: number; ty: number; cx: number; cy: number } | null>(null);
+  const viewPosition = useRef({ tx: mobileTx, ty: mobileTy });
+  useEffect(() => { viewPosition.current = { tx: mobileTx, ty: mobileTy }; }, [mobileTx, mobileTy]);
   const lastPanPoint = useRef<{ x: number; y: number } | null>(null);
   const lastTapAt = useRef<number>(0);
 
@@ -77,10 +81,12 @@ export const useTouchZoom = (
   const scrollFrame = useRef<number | null>(null);
   const scrollStartedOnVideo = useRef(false);
   const scrollHandler = useRef(onTouchScroll);
+  const takeoverHandler = useRef(onMultiTouchStart);
 
   useEffect(() => {
     scrollHandler.current = onTouchScroll;
-  }, [onTouchScroll]);
+    takeoverHandler.current = onMultiTouchStart;
+  }, [onTouchScroll, onMultiTouchStart]);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -170,6 +176,7 @@ export const useTouchZoom = (
       activeTouchPointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
       const pointerCount = activeTouchPointers.current.size;
       let shouldHandleLocalGesture = false;
+      if (pointerCount === 2) takeoverHandler.current?.();
 
       if (localZoom) {
         if (pointerCount === 1) {
@@ -184,17 +191,17 @@ export const useTouchZoom = (
             shouldHandleLocalGesture = true;
           }
           lastTapAt.current = now;
-          if (mobileScaleRef.current > 1) {
-            lastPanPoint.current = { x: e.clientX, y: e.clientY };
-            shouldHandleLocalGesture = true;
-          } else {
-            lastPanPoint.current = null;
-          }
+          // One finger belongs to the remote pointer, including while zoomed.
+          lastPanPoint.current = null;
         } else if (pointerCount === 2) {
           const pts = Array.from(activeTouchPointers.current.values());
           const d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
           initialPinchDistance.current = d;
           initialPinchScale.current = mobileScaleRef.current;
+          const center = centroid()!;
+          const viewport = el.parentElement!.getBoundingClientRect();
+          pinchOrigin.current = { x: center.x, y: center.y, ...viewPosition.current,
+            cx: viewport.x + viewport.width / 2, cy: viewport.y + viewport.height / 2 };
           shouldHandleLocalGesture = true;
         }
       } else if (localScroll && pointerCount >= 2) {
@@ -209,9 +216,8 @@ export const useTouchZoom = (
 
       lastPointerCount.current = pointerCount;
 
-      // A second finger must still reach the video handler: that is where the
-      // first finger's press is released and its pending long press is dropped.
-      // This holds whichever two-finger behaviour is active, pinch or scroll.
+      // The explicit takeover callback also covers a second finger that lands
+      // in the letterbox rather than on the video element.
       const multiTouchTakeover = pointerCount >= 2;
       if (shouldHandleLocalGesture) {
         e.preventDefault();
@@ -221,7 +227,6 @@ export const useTouchZoom = (
 
     const onPointerMove = (e: PointerEvent) => {
       if (e.pointerType !== "touch") return;
-      const prev = activeTouchPointers.current.get(e.pointerId);
       activeTouchPointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
       const pts = Array.from(activeTouchPointers.current.values());
       let shouldHandleLocalGesture = false;
@@ -232,13 +237,13 @@ export const useTouchZoom = (
           const factor = d / initialPinchDistance.current;
           const next = Math.max(1, Math.min(MAX_SCALE, initialPinchScale.current * factor));
           setMobileScale(next);
-          shouldHandleLocalGesture = true;
-        } else if (pts.length === 1 && mobileScaleRef.current > 1 && lastPanPoint.current && prev) {
-          const dx = e.clientX - lastPanPoint.current.x;
-          const dy = e.clientY - lastPanPoint.current.y;
-          lastPanPoint.current = { x: e.clientX, y: e.clientY };
-          setMobileTx(v => v + dx);
-          setMobileTy(v => v + dy);
+          const origin = pinchOrigin.current;
+          const center = centroid();
+          if (origin && center) {
+            const ratio = next / initialPinchScale.current;
+            setMobileTx((origin.tx - (origin.x - origin.cx)) * ratio + center.x - origin.cx);
+            setMobileTy((origin.ty - (origin.y - origin.cy)) * ratio + center.y - origin.cy);
+          }
           shouldHandleLocalGesture = true;
         }
       } else if (localScroll && pts.length >= 2) {
@@ -265,13 +270,20 @@ export const useTouchZoom = (
       if (e.pointerType !== "touch") return;
       const wasHandlingLocalGesture =
         localZoom &&
-        (initialPinchDistance.current !== null || mobileScaleRef.current > 1);
+        initialPinchDistance.current !== null;
       const wasScrolling = localScroll && scrollStartedOnVideo.current;
       activeTouchPointers.current.delete(e.pointerId);
       const pointerCount = activeTouchPointers.current.size;
       lastPointerCount.current = pointerCount;
       if (pointerCount < 2) {
         initialPinchDistance.current = null;
+        pinchOrigin.current = null;
+        // Keep the final scroll delta even when touchend arrives before the
+        // animation frame that was going to send it.
+        if (wasScrolling) {
+          if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current);
+          flushScroll();
+        }
       }
       if (pointerCount === 0) {
         lastPanPoint.current = null;
@@ -303,7 +315,26 @@ export const useTouchZoom = (
     const onContextMenu = (e: Event) => e.preventDefault();
     el.addEventListener("contextmenu", onContextMenu, { signal });
 
+    const cancelGesture = () => {
+      takeoverHandler.current?.();
+      activeTouchPointers.current.clear();
+      initialPinchDistance.current = null;
+      pinchOrigin.current = null;
+      lastPanPoint.current = null;
+      lastPointerCount.current = 0;
+      resetScrollGesture();
+      if (scrollFrame.current !== null) cancelAnimationFrame(scrollFrame.current);
+      scrollFrame.current = null;
+      pendingScroll.current = { x: 0, y: 0 };
+    };
+    window.addEventListener("blur", cancelGesture, { signal });
+    window.addEventListener("resize", cancelGesture, { signal });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) cancelGesture();
+    }, { signal });
+
     return () => {
+      cancelGesture();
       abortController.abort();
       // A queued frame would otherwise fire after unmount and scroll a host that
       // no longer has a surface to stop it.
@@ -345,17 +376,44 @@ export const useTouchZoom = (
     return () => window.clearTimeout(timeout);
   }, [mobileScale, mobileTx, mobileTy]);
 
-  useEffect(() => {
+  const clampPan = useCallback(() => {
     const container = containerRef.current;
     if (!container) return;
+    const video = container.querySelector("video");
     const cw = container.clientWidth;
     const ch = container.clientHeight;
     if (!cw || !ch) return;
-    const maxX = (cw * (mobileScale - 1)) / 2;
-    const maxY = (ch * (mobileScale - 1)) / 2;
+    // The video uses object-fit: contain. Letterbox space cannot be panned
+    // like image content, or a portrait phone can move the whole picture away.
+    const aspect = video?.videoWidth && video.videoHeight
+      ? video.videoWidth / video.videoHeight
+      : cw / ch;
+    const contentWidth = Math.min(cw, ch * aspect);
+    const contentHeight = Math.min(ch, cw / aspect);
+    const maxX = Math.max(0, (contentWidth * mobileScaleRef.current - cw) / 2);
+    const maxY = Math.max(0, (contentHeight * mobileScaleRef.current - ch) / 2);
     setMobileTx(x => Math.max(-maxX, Math.min(maxX, x)));
     setMobileTy(y => Math.max(-maxY, Math.min(maxY, y)));
-  }, [mobileScale, containerRef]);
+  }, [containerRef]);
+
+  useEffect(clampPan, [clampPan, mobileScale, mobileTx, mobileTy]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const video = container.querySelector("video");
+    // Rotation, the software keyboard and auto-hiding bars all resize the view.
+    // Clamp again even when the zoom level itself has not changed.
+    const observer = new ResizeObserver(clampPan);
+    observer.observe(container);
+    video?.addEventListener("loadedmetadata", clampPan);
+    video?.addEventListener("resize", clampPan);
+    return () => {
+      observer.disconnect();
+      video?.removeEventListener("loadedmetadata", clampPan);
+      video?.removeEventListener("resize", clampPan);
+    };
+  }, [clampPan, containerRef]);
 
   return {
     mobileScale,

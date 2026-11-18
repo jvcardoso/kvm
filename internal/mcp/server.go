@@ -130,7 +130,7 @@ type Input interface {
 	ReleaseKeys() error
 	// ParseCombo splits key names into modifier bits and key codes.
 	ParseCombo(names []string) (modifier uint8, keys []uint8, err error)
-	// TypeText types ASCII text with the given delay between keystrokes.
+	// TypeText types text with the given delay between keystrokes.
 	TypeText(text string, delay time.Duration) error
 	// AbsPosition returns the pointer position in HID logical units.
 	AbsPosition() (x, y int)

@@ -146,9 +146,11 @@ function ToolButton({
     <button
       type="button"
       aria-label={label}
+      title={label}
+      aria-pressed={active}
       style={{ touchAction: "none" }}
       className={cx(
-        "flex h-8 w-8 items-center justify-center rounded-full transition-all duration-100 ease-out",
+        "flex h-11 w-11 items-center justify-center rounded-full transition-all duration-100 ease-out",
         active
           ? "bg-blue-500 text-white"
           : isDark
@@ -746,7 +748,7 @@ export default function VirtualMouseOverlay({
         <ToolButton
           active={isTouchGestureEnabled}
           isDark={isDark}
-          label={$at("Zoom")}
+          label={isTouchGestureEnabled ? $at("Pinch to zoom") : $at("Two-finger scroll")}
           onClick={onToggleTouchGesture}
         >
           <LuZoomIn className="h-[18px] w-[18px]" />
@@ -783,7 +785,7 @@ export default function VirtualMouseOverlay({
       {editing && (
         <div
           className={cx(
-            "pointer-events-auto absolute left-2.5 right-[88px] top-3 z-[60] overflow-hidden rounded-xl border shadow-lg",
+            "pointer-events-auto absolute left-2.5 right-[118px] top-3 z-[60] max-h-[calc(100%_-_1.5rem)] overflow-y-auto rounded-xl border shadow-lg",
             isDark
               ? "border-white/[0.18] bg-black/[0.62] text-white"
               : "border-black/[0.12] bg-white/[0.88] text-black",

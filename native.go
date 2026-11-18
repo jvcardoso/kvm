@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -51,9 +52,13 @@ func nextSeq() int32 {
 	return atomic.AddInt32(&seq, 1)
 }
 
-var ongoingRequests = make(map[int32]chan *CtrlResponse)
+var (
+	ongoingRequests     = make(map[int32]chan *CtrlResponse)
+	ongoingRequestsLock = &sync.Mutex{}
+	ctrlConnWriteLock   = make(nativeControlLock, 1)
+)
 
-var lock = &sync.Mutex{}
+var videoActionGate = make(chan struct{}, 1)
 
 var (
 	videoCmd     *exec.Cmd
@@ -69,21 +74,34 @@ var jpegReadyCh = make(chan struct{}, 1)
 // VENC_GetStream giving up, unwritable spool file, uninitialised JPEG channel.
 var jpegFailedCh = make(chan string, 1)
 
+const videoCtrlTimeout = 5 * time.Second
+
 func CallCtrlAction(action string, params map[string]interface{}) (*CtrlResponse, error) {
-	lock.Lock()
-	defer lock.Unlock()
+	return callCtrlActionUntil(action, params, time.Now().Add(videoCtrlTimeout))
+}
+
+func callCtrlActionUntil(action string, params map[string]interface{}, deadline time.Time) (*CtrlResponse, error) {
+	release, err := acquireNativeAction(videoActionGate, deadline)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	responseChan := make(chan *CtrlResponse, 1)
+	ctrlSeq := nextSeq()
+	ongoingRequestsLock.Lock()
+	ongoingRequests[ctrlSeq] = responseChan
+	ongoingRequestsLock.Unlock()
+
 	ctrlAction := CtrlAction{
 		Action: action,
-		Seq:    nextSeq(),
+		Seq:    ctrlSeq,
 		Params: params,
 	}
 
-	responseChan := make(chan *CtrlResponse, 1)
-	ongoingRequests[ctrlAction.Seq] = responseChan
-
 	jsonData, err := json.Marshal(ctrlAction)
 	if err != nil {
-		delete(ongoingRequests, ctrlAction.Seq)
+		dropCtrlResponseChan(ctrlSeq)
 		return nil, fmt.Errorf("error marshaling ctrl action: %w", err)
 	}
 
@@ -93,15 +111,17 @@ func CallCtrlAction(action string, params map[string]interface{}) (*CtrlResponse
 
 	scopedLogger.Debug().Msg("sending ctrl action")
 
-	err = WriteCtrlMessage(jsonData)
+	err = writeCtrlMessageUntil(jsonData, deadline)
 	if err != nil {
-		delete(ongoingRequests, ctrlAction.Seq)
-		return nil, ErrorfL(&scopedLogger, "error writing ctrl message", err)
+		dropCtrlResponseChan(ctrlSeq)
+		return nil, fmt.Errorf("writing native control message: %w", err)
 	}
 
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case response := <-responseChan:
-		delete(ongoingRequests, ctrlAction.Seq)
+		dropCtrlResponseChan(ctrlSeq)
 		if response.Error != "" {
 			return nil, ErrorfL(
 				&scopedLogger,
@@ -110,18 +130,87 @@ func CallCtrlAction(action string, params map[string]interface{}) (*CtrlResponse
 			)
 		}
 		return response, nil
-	case <-time.After(5 * time.Second):
-		close(responseChan)
-		delete(ongoingRequests, ctrlAction.Seq)
-		return nil, ErrorfL(&scopedLogger, "timeout waiting for response", nil)
+	case <-timer.C:
+		// Never close the channel here: a late response must be dropped, not sent
+		// on a closed channel (which panics the process).
+		dropCtrlResponseChan(ctrlSeq)
+		return nil, fmt.Errorf("waiting for native response: %w", os.ErrDeadlineExceeded)
+	}
+}
+
+func dropCtrlResponseChan(ctrlSeq int32) {
+	ongoingRequestsLock.Lock()
+	delete(ongoingRequests, ctrlSeq)
+	ongoingRequestsLock.Unlock()
+}
+
+func deliverCtrlResponse(ctrlSeq int32, response *CtrlResponse) {
+	ongoingRequestsLock.Lock()
+	defer ongoingRequestsLock.Unlock()
+
+	responseChan, ok := ongoingRequests[ctrlSeq]
+	if !ok {
+		return
+	}
+
+	select {
+	case responseChan <- response:
+	default:
 	}
 }
 
 func WriteCtrlMessage(message []byte) error {
-	if ctrlSocketConn == nil {
-		return fmt.Errorf("ctrl socket not conn ected")
+	return writeCtrlMessageUntil(message, time.Now().Add(videoCtrlTimeout))
+}
+
+func writeCtrlMessageUntil(message []byte, deadline time.Time) error {
+	release, err := acquireNativeAction(ctrlConnWriteLock, deadline)
+	if err != nil {
+		return err
 	}
-	_, err := ctrlSocketConn.Write(message)
+	defer release()
+	return writeNativeControl(ctrlSocketConn, message, deadline)
+}
+
+type nativeControlLock chan struct{}
+
+func (gate nativeControlLock) Lock()   { gate <- struct{}{} }
+func (gate nativeControlLock) Unlock() { <-gate }
+
+func acquireNativeAction(gate chan struct{}, deadline time.Time) (func(), error) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("waiting for native control slot: %w", os.ErrDeadlineExceeded)
+	}
+}
+
+// The caller serializes writes so each packet owns the connection deadline.
+func writeNativeControl(conn net.Conn, message []byte, deadline time.Time) (err error) {
+	if !time.Now().Before(deadline) {
+		return os.ErrDeadlineExceeded
+	}
+	if conn == nil {
+		return errors.New("native control socket not connected")
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	defer func() {
+		if resetErr := conn.SetWriteDeadline(time.Time{}); err == nil {
+			err = resetErr
+		}
+	}()
+	n, err := conn.Write(message)
+	if n > 0 && n != len(message) {
+		_ = conn.Close()
+	}
+	if err == nil && n != len(message) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -202,15 +291,17 @@ func handleCtrlClient(conn net.Conn) {
 		Logger()
 
 	scopedLogger.Info().Msg("native ctrl socket client connected")
+	ctrlConnWriteLock.Lock()
 	if ctrlSocketConn != nil {
 		scopedLogger.Debug().Msg("closing existing native socket connection")
 		ctrlSocketConn.Close()
 	}
-
 	ctrlSocketConn = conn
+	ctrlConnWriteLock.Unlock()
 
-	// Restore HDMI EDID if applicable. Guarded so a reconnect does not re-apply it.
+	// Restore HDMI EDID and video settings if applicable.
 	go restoreHdmiEdidOnce()
+	go restoreVideoSettingsToNative()
 
 	readBuf := make([]byte, 4096)
 	for {
@@ -229,10 +320,8 @@ func handleCtrlClient(conn net.Conn) {
 		scopedLogger.Trace().Interface("data", ctrlResp).Msg("ctrl sock msg")
 
 		if ctrlResp.Seq != 0 {
-			responseChan, ok := ongoingRequests[ctrlResp.Seq]
-			if ok {
-				responseChan <- &ctrlResp
-			}
+			response := ctrlResp
+			deliverCtrlResponse(response.Seq, &response)
 		}
 		switch ctrlResp.Event {
 		case "video_input_state":
@@ -287,8 +376,8 @@ func handleVideoClient(conn net.Conn) {
 		// Broadcast to HTTP clients
 		videoBroadcaster.Broadcast(inboundPacket[:n])
 
-		if currentSession != nil {
-			err := currentSession.VideoTrack.WriteSample(media.Sample{Data: inboundPacket[:n], Duration: sinceLastFrame})
+		if session := currentSession.Load(); session != nil {
+			err := session.VideoTrack.WriteSample(media.Sample{Data: inboundPacket[:n], Duration: sinceLastFrame})
 			if err != nil {
 				scopedLogger.Warn().Err(err).Msg("error writing sample")
 			}
@@ -391,11 +480,12 @@ func ExtractAndRunVideoBin() error {
 // value always wins. On first boot there is no configured value yet, so the
 // built-in default is written to the config and used from then on.
 func restoreHdmiEdid() bool {
-	edid := config.EdidString
+	edid := configSnapshot().EdidString
 	if edid == "" {
 		edid = defaultEdidHex
-		config.EdidString = edid
-		if err := SaveConfig(); err != nil {
+		if err := updateConfig(func(next *Config) {
+			next.EdidString = edid
+		}); err != nil {
 			videoLogger.Warn().Err(err).Msg("Failed to persist default HDMI EDID")
 		} else {
 			videoLogger.Info().Msg("Persisted default HDMI EDID to config")
@@ -428,5 +518,40 @@ func restoreHdmiEdidOnce() {
 	}
 	if restoreHdmiEdid() {
 		edidRestored = true
+	}
+}
+
+// restoreVideoSettingsToNative reapplies persisted video encoder settings (codec,
+// quality factor, and rate control) whenever the native video process connects.
+func restoreVideoSettingsToNative() {
+	videoSettingsMutex.Lock()
+	defer videoSettingsMutex.Unlock()
+
+	cfg := configSnapshot()
+	if cfg == nil {
+		return
+	}
+	codec, factor, rc := cfg.StreamEncodecType, cfg.StreamQualityFactor, cfg.VideoRc
+
+	if codec == "hevc" || codec == "avc" {
+		if _, err := CallCtrlAction("set_video_encodec_type", map[string]interface{}{"encodec_type": codec}); err != nil {
+			videoLogger.Warn().Err(err).Str("encodec_type", codec).Msg("Failed to restore video codec to native")
+		} else {
+			streamUsesHEVC.Store(codec == "hevc")
+		}
+	}
+
+	if factor > 0 {
+		if _, err := CallCtrlAction("set_video_quality_factor", map[string]interface{}{"quality_factor": factor}); err != nil {
+			videoLogger.Warn().Err(err).Float64("quality_factor", factor).Msg("Failed to restore video quality factor to native")
+		} else {
+			setAppliedStreamFactor(factor)
+		}
+	}
+
+	if rc != nil {
+		if err := applyVideoRcToNative(*rc); err != nil {
+			videoLogger.Warn().Err(err).Msg("Failed to restore video RC params to native")
+		}
 	}
 }

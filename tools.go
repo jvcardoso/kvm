@@ -6,9 +6,11 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +23,8 @@ import (
 
 const vpnToolsRoot = "/userdata/vpn-tools"
 const vntPinnedVersion = "v1.2.16"
+
+var vpnToolActivationMutex sync.Mutex
 
 type vpnToolSpec struct {
 	Name          string
@@ -99,6 +103,8 @@ type VpnToolRelease struct {
 type githubReleaseAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
+	Digest             string `json:"digest"`
+	Size               int64  `json:"size"`
 }
 
 type githubRelease struct {
@@ -290,7 +296,7 @@ func listManagedVersions(spec vpnToolSpec) []string {
 	}
 	versions := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
 			versions = append(versions, e.Name())
 		}
 	}
@@ -300,6 +306,17 @@ func listManagedVersions(spec vpnToolSpec) []string {
 
 func currentManagedVersion(spec vpnToolSpec) string {
 	currentDir := vpnToolCurrentDir(spec)
+	if target, err := os.Readlink(currentDir); err == nil {
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(currentDir), target)
+		}
+		target = filepath.Clean(target)
+		if filepath.Dir(target) == vpnToolVersionsDir(spec) {
+			return filepath.Base(target)
+		}
+		return ""
+	}
+	// Older installations use a directory containing one symlink per binary.
 	for _, binary := range spec.Binaries {
 		p := filepath.Join(currentDir, binary)
 		target, err := os.Readlink(p)
@@ -322,9 +339,12 @@ func currentManagedVersion(spec vpnToolSpec) string {
 	return ""
 }
 
-func initVpnToolInstallTask(tool, version string) {
+func initVpnToolInstallTask(tool, version string) error {
 	vpnToolInstallTaskMu.Lock()
 	defer vpnToolInstallTaskMu.Unlock()
+	if task, ok := vpnToolInstallTasks[tool]; ok && task.Running {
+		return fmt.Errorf("install task is already running for %s", tool)
+	}
 	vpnToolInstallTasks[tool] = &VpnToolInstallTask{
 		Tool:      tool,
 		Running:   true,
@@ -335,6 +355,7 @@ func initVpnToolInstallTask(tool, version string) {
 		Version:   version,
 		UpdatedAt: time.Now().Unix(),
 	}
+	return nil
 }
 
 func updateVpnToolInstallTask(tool string, progress float64, message string) {
@@ -550,7 +571,7 @@ func rpcListVpnToolReleases(tool string) ([]VpnToolRelease, error) {
 	return results, nil
 }
 
-func downloadFileToPath(url, targetPath string, onProgress func(downloaded int64, total int64)) error {
+func downloadFileToPath(url, targetPath string, expectedSize int64, onProgress func(downloaded int64, total int64)) error {
 	if strings.TrimSpace(url) == "" {
 		return fmt.Errorf("empty download url")
 	}
@@ -564,13 +585,13 @@ func downloadFileToPath(url, targetPath string, onProgress func(downloaded int64
 		return fmt.Errorf("failed to create download request: %w", err)
 	}
 	req.Header.Set("User-Agent", "kvm-vpn-tool-manager")
-	client := &http.Client{Timeout: 2 * time.Minute}
+	client := &http.Client{Timeout: 2 * time.Minute, CheckRedirect: checkVpnToolDownloadRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to download file: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return fmt.Errorf("download failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -586,6 +607,9 @@ func downloadFileToPath(url, targetPath string, onProgress func(downloaded int64
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			if int64(n) > expectedSize-downloaded {
+				return fmt.Errorf("VPN asset exceeds its published size")
+			}
 			written, writeErr := out.Write(buf[:n])
 			if writeErr != nil {
 				return fmt.Errorf("failed to write target file: %w", writeErr)
@@ -605,7 +629,10 @@ func downloadFileToPath(url, targetPath string, onProgress func(downloaded int64
 			return fmt.Errorf("failed to read download stream: %w", readErr)
 		}
 	}
-	return nil
+	if downloaded != expectedSize {
+		return fmt.Errorf("VPN asset size mismatch: got %d, expected %d", downloaded, expectedSize)
+	}
+	return out.Close()
 }
 
 func extractFromTarGz(archivePath string, targetBinaryNames []string, outDir string) (map[string]bool, error) {
@@ -643,19 +670,13 @@ func extractFromTarGz(archivePath string, targetBinaryNames []string, outDir str
 		if !need[base] {
 			continue
 		}
-		dstPath := filepath.Join(outDir, base)
-		dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-		if err != nil {
-			return found, err
-		}
-		if _, err := io.Copy(dst, tr); err != nil {
-			dst.Close()
-			return found, err
-		}
-		if err := dst.Close(); err != nil {
+		if err := writeVpnToolBinary(filepath.Join(outDir, base), tr); err != nil {
 			return found, err
 		}
 		found[base] = true
+	}
+	if _, err := io.Copy(io.Discard, gzReader); err != nil {
+		return found, err
 	}
 	return found, nil
 }
@@ -679,28 +700,38 @@ func extractFromZip(archivePath string, targetBinaryNames []string, outDir strin
 		if !need[base] {
 			continue
 		}
+		if !f.Mode().IsRegular() {
+			return found, fmt.Errorf("VPN archive entry %s is not a regular file", base)
+		}
 		src, err := f.Open()
 		if err != nil {
 			return found, err
 		}
-		dstPath := filepath.Join(outDir, base)
-		dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-		if err != nil {
-			src.Close()
-			return found, err
-		}
-		if _, err := io.Copy(dst, src); err != nil {
-			src.Close()
-			dst.Close()
-			return found, err
-		}
+		err = writeVpnToolBinary(filepath.Join(outDir, base), src)
 		src.Close()
-		if err := dst.Close(); err != nil {
+		if err != nil {
 			return found, err
 		}
 		found[base] = true
 	}
 	return found, nil
+}
+
+func writeVpnToolBinary(path string, src io.Reader) error {
+	dst, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0755)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(dst, src)
+	if copyErr != nil {
+		dst.Close()
+		return copyErr
+	}
+	if err := dst.Sync(); err != nil {
+		dst.Close()
+		return err
+	}
+	return dst.Close()
 }
 
 func ensureBinariesInstalled(found map[string]bool, required []string) error {
@@ -719,15 +750,161 @@ func ensureBinariesInstalled(found map[string]bool, required []string) error {
 func setupCurrentSymlinks(spec vpnToolSpec, version string) error {
 	currentDir := vpnToolCurrentDir(spec)
 	versionDir := filepath.Join(vpnToolVersionsDir(spec), version)
-	if err := os.MkdirAll(currentDir, 0755); err != nil {
+	return switchVpnToolCurrent(currentDir, versionDir)
+}
+
+func switchVpnToolCurrent(currentDir, versionDir string) error {
+	stage, err := os.MkdirTemp(filepath.Dir(currentDir), ".activation-")
+	if err != nil {
 		return err
 	}
-	for _, b := range spec.Binaries {
-		currentLink := filepath.Join(currentDir, b)
-		_ = os.Remove(currentLink)
-		target := filepath.Join(versionDir, b)
-		if err := os.Symlink(target, currentLink); err != nil {
-			return fmt.Errorf("failed to update current binary symlink for %s: %w", b, err)
+	defer os.RemoveAll(stage)
+
+	link := filepath.Join(stage, "current")
+	if err := os.Symlink(versionDir, link); err != nil {
+		return err
+	}
+	info, err := os.Lstat(currentDir)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err == nil && info.IsDir() {
+		// Convert the legacy directory and all of its binary links in one swap.
+		return exchangeVpnToolPaths(link, currentDir)
+	}
+	return os.Rename(link, currentDir)
+}
+
+func promoteVpnToolPackage(staged, versionDir string, activate func() error) (keepStage bool, err error) {
+	_, err = os.Lstat(versionDir)
+	reinstall := err == nil
+	switch {
+	case reinstall:
+		err = exchangeVpnToolPaths(staged, versionDir)
+	case os.IsNotExist(err):
+		err = os.Rename(staged, versionDir)
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to publish VPN package: %w", err)
+	}
+	if err := activate(); err != nil {
+		if reinstall {
+			if rollbackErr := exchangeVpnToolPaths(staged, versionDir); rollbackErr != nil {
+				return true, errors.Join(err, fmt.Errorf("previous VPN package retained at %s: %w", staged, rollbackErr))
+			}
+		} else if rollbackErr := os.Rename(versionDir, staged); rollbackErr != nil {
+			return false, errors.Join(err, fmt.Errorf("failed to roll back VPN installation: %w", rollbackErr))
+		}
+		return false, err
+	}
+	return false, nil
+}
+
+func validVpnToolVersion(version string) bool {
+	return version != "" && !strings.HasPrefix(version, ".") &&
+		!strings.Contains(version, "..") && !strings.ContainsAny(version, `/\`)
+}
+
+func validateVpnToolDownloadURL(spec vpnToolSpec, rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || !strings.EqualFold(u.Host, "github.com") ||
+		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("downloadURL must point to an official GitHub release asset")
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) != 6 || !strings.EqualFold(strings.Join(parts[:2], "/"), spec.Repo) ||
+		parts[2] != "releases" || parts[3] != "download" ||
+		parts[4] == "" || parts[4] == "." || parts[4] == ".." ||
+		parts[5] == "" || parts[5] == "." || parts[5] == ".." || strings.Contains(u.Path, "\\") {
+		return fmt.Errorf("downloadURL does not match an official release asset of %s", spec.Repo)
+	}
+	return nil
+}
+
+func checkVpnToolDownloadRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 || req.URL.Scheme != "https" || req.URL.User != nil {
+		return fmt.Errorf("invalid GitHub release download redirect")
+	}
+	switch req.URL.Host {
+	case "release-assets.githubusercontent.com", "objects.githubusercontent.com":
+		return nil
+	default:
+		return fmt.Errorf("unexpected GitHub release download redirect host %q", req.URL.Host)
+	}
+}
+
+func resolveVpnToolAsset(spec vpnToolSpec, version, assetName, downloadURL string) (githubReleaseAsset, error) {
+	var asset githubReleaseAsset
+	if err := validateVpnToolDownloadURL(spec, downloadURL); err != nil {
+		return asset, err
+	}
+
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", spec.Repo, url.PathEscape(version))
+	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	if err != nil {
+		return asset, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "kvm-vpn-tool-manager")
+	client := &http.Client{
+		Timeout:       20 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return asset, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return asset, fmt.Errorf("fetching official release metadata returned %s", resp.Status)
+	}
+	var release githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return asset, err
+	}
+	if !release.Draft && release.TagName == version {
+		for _, candidate := range release.Assets {
+			if candidate.Name == assetName && candidate.BrowserDownloadURL == downloadURL && candidate.Size > 0 {
+				return candidate, nil
+			}
+		}
+	}
+	return asset, fmt.Errorf("asset is not published in the selected release of %s", spec.Repo)
+}
+
+func stageVpnToolPackage(packagePath, assetName string, binaries []string, stage string) error {
+	assetLower := strings.ToLower(assetName)
+	found := map[string]bool{}
+	var err error
+	switch {
+	case strings.HasSuffix(assetLower, ".tar.gz") || strings.HasSuffix(assetLower, ".tgz"):
+		found, err = extractFromTarGz(packagePath, binaries, stage)
+	case strings.HasSuffix(assetLower, ".zip"):
+		found, err = extractFromZip(packagePath, binaries, stage)
+	default:
+		if len(binaries) != 1 {
+			return fmt.Errorf("single binary install needs exactly one binary")
+		}
+		input, err := os.Open(packagePath)
+		if err != nil {
+			return err
+		}
+		defer input.Close()
+		if err := writeVpnToolBinary(filepath.Join(stage, binaries[0]), input); err != nil {
+			return err
+		}
+		found[binaries[0]] = true
+	}
+	if err != nil {
+		return fmt.Errorf("failed to extract VPN package: %w", err)
+	}
+	if err := ensureBinariesInstalled(found, binaries); err != nil {
+		return err
+	}
+	for _, binary := range binaries {
+		info, err := os.Lstat(filepath.Join(stage, binary))
+		if err != nil || !info.Mode().IsRegular() || info.Size() == 0 || info.Mode().Perm()&0111 == 0 {
+			return fmt.Errorf("invalid executable %s in VPN package", binary)
 		}
 	}
 	return nil
@@ -739,22 +916,37 @@ func rpcInstallVpnTool(tool, version, assetName, downloadURL string) error {
 		return err
 	}
 	version = strings.TrimSpace(version)
-	if version == "" {
-		return fmt.Errorf("version is required")
+	if !validVpnToolVersion(version) {
+		return fmt.Errorf("valid version is required")
 	}
 	if spec.Name == "vnt" && version != vntPinnedVersion && version != strings.TrimPrefix(vntPinnedVersion, "v") {
 		return fmt.Errorf("vnt install is temporarily pinned to %s", vntPinnedVersion)
 	}
-	downloadURL = strings.TrimSpace(downloadURL)
-	if downloadURL == "" {
-		return fmt.Errorf("downloadURL is required")
+	asset, err := resolveVpnToolAsset(spec, version, strings.TrimSpace(assetName), strings.TrimSpace(downloadURL))
+	if err != nil {
+		return err
 	}
 
-	versionDir := filepath.Join(vpnToolVersionsDir(spec), version)
-	appendVpnToolInstallLog(tool, "Preparing version directory...")
+	versionsDir := vpnToolVersionsDir(spec)
+	versionDir := filepath.Join(versionsDir, version)
+	appendVpnToolInstallLog(tool, "Preparing temporary installation directory...")
 	updateVpnToolInstallTask(tool, 0.05, "preparing")
-	if err := os.MkdirAll(versionDir, 0755); err != nil {
-		return fmt.Errorf("failed to create version directory: %w", err)
+	if err := os.MkdirAll(versionsDir, 0755); err != nil {
+		return err
+	}
+	stage, err := os.MkdirTemp(versionsDir, ".install-")
+	if err != nil {
+		return err
+	}
+	keepStage := false
+	defer func() {
+		if !keepStage {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	stagedPackage := filepath.Join(stage, "package")
+	if err := os.Mkdir(stagedPackage, 0755); err != nil {
+		return err
 	}
 
 	tmpFile, err := os.CreateTemp("", "vpn-tool-*")
@@ -766,7 +958,7 @@ func rpcInstallVpnTool(tool, version, assetName, downloadURL string) error {
 	defer os.Remove(tmpPath)
 
 	appendVpnToolInstallLog(tool, "Downloading release package...")
-	if err := downloadFileToPath(downloadURL, tmpPath, func(downloaded int64, total int64) {
+	if err := downloadFileToPath(asset.BrowserDownloadURL, tmpPath, asset.Size, func(downloaded int64, total int64) {
 		if total > 0 {
 			ratio := float64(downloaded) / float64(total)
 			updateVpnToolInstallTask(tool, 0.1+ratio*0.65, "downloading")
@@ -779,57 +971,32 @@ func rpcInstallVpnTool(tool, version, assetName, downloadURL string) error {
 	}
 	appendVpnToolInstallLog(tool, "Download completed.")
 
-	assetLower := strings.ToLower(strings.TrimSpace(assetName))
-	if assetLower == "" {
-		assetLower = strings.ToLower(strings.TrimSpace(downloadURL))
+	// Older GitHub releases omit the digest. Their assets are still bound to the
+	// authenticated release metadata and checked against its published size.
+	if asset.Digest != "" {
+		hash, err := hashFileSHA256(tmpPath)
+		if err != nil {
+			return err
+		}
+		if fmt.Sprintf("sha256:%x", hash) != asset.Digest {
+			return fmt.Errorf("VPN asset SHA-256 digest mismatch")
+		}
 	}
 
-	found := map[string]bool{}
 	updateVpnToolInstallTask(tool, 0.8, "extracting")
 	appendVpnToolInstallLog(tool, "Extracting package...")
-	switch {
-	case strings.HasSuffix(assetLower, ".tar.gz") || strings.HasSuffix(assetLower, ".tgz"):
-		found, err = extractFromTarGz(tmpPath, spec.Binaries, versionDir)
-		if err != nil {
-			return fmt.Errorf("failed to extract tar.gz: %w", err)
-		}
-	case strings.HasSuffix(assetLower, ".zip"):
-		found, err = extractFromZip(tmpPath, spec.Binaries, versionDir)
-		if err != nil {
-			return fmt.Errorf("failed to extract zip: %w", err)
-		}
-	default:
-		if len(spec.Binaries) != 1 {
-			return fmt.Errorf("single binary install is not supported for %s", spec.Name)
-		}
-		dstPath := filepath.Join(versionDir, spec.Binaries[0])
-		input, err := os.Open(tmpPath)
-		if err != nil {
-			return err
-		}
-		defer input.Close()
-		output, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(output, input); err != nil {
-			output.Close()
-			return err
-		}
-		if err := output.Close(); err != nil {
-			return err
-		}
-		found[spec.Binaries[0]] = true
-	}
-
-	appendVpnToolInstallLog(tool, "Validating installed binaries...")
-	updateVpnToolInstallTask(tool, 0.92, "validating")
-	if err := ensureBinariesInstalled(found, spec.Binaries); err != nil {
+	if err := stageVpnToolPackage(tmpPath, asset.Name, spec.Binaries, stagedPackage); err != nil {
 		return err
 	}
+
 	appendVpnToolInstallLog(tool, "Switching to installed version...")
 	updateVpnToolInstallTask(tool, 0.97, "activating")
-	if err := setupCurrentSymlinks(spec, version); err != nil {
+	vpnToolActivationMutex.Lock()
+	keepStage, err = promoteVpnToolPackage(stagedPackage, versionDir, func() error {
+		return setupCurrentSymlinks(spec, version)
+	})
+	vpnToolActivationMutex.Unlock()
+	if err != nil {
 		return err
 	}
 	updateVpnToolInstallTask(tool, 1, "completed")
@@ -842,14 +1009,9 @@ func rpcStartVpnToolInstall(tool, version, assetName, downloadURL string) error 
 		return err
 	}
 
-	vpnToolInstallTaskMu.Lock()
-	if task, ok := vpnToolInstallTasks[tool]; ok && task.Running {
-		vpnToolInstallTaskMu.Unlock()
-		return fmt.Errorf("install task is already running for %s", tool)
+	if err := initVpnToolInstallTask(tool, version); err != nil {
+		return err
 	}
-	vpnToolInstallTaskMu.Unlock()
-
-	initVpnToolInstallTask(tool, version)
 	go func() {
 		err := rpcInstallVpnTool(tool, version, assetName, downloadURL)
 		finishVpnToolInstallTask(tool, err)
@@ -863,9 +1025,11 @@ func rpcUseVpnToolVersion(tool, version string) error {
 		return err
 	}
 	version = strings.TrimSpace(version)
-	if version == "" {
-		return fmt.Errorf("version is required")
+	if !validVpnToolVersion(version) {
+		return fmt.Errorf("valid version is required")
 	}
+	vpnToolActivationMutex.Lock()
+	defer vpnToolActivationMutex.Unlock()
 	versionDir := filepath.Join(vpnToolVersionsDir(spec), version)
 	info, err := os.Stat(versionDir)
 	if err != nil {
@@ -888,26 +1052,24 @@ func rpcUninstallVpnToolVersion(tool, version string) error {
 		return err
 	}
 	version = strings.TrimSpace(version)
-	if version == "" {
-		return fmt.Errorf("version is required")
+	if !validVpnToolVersion(version) {
+		return fmt.Errorf("valid version is required")
 	}
+	vpnToolActivationMutex.Lock()
+	defer vpnToolActivationMutex.Unlock()
 	versionDir := filepath.Join(vpnToolVersionsDir(spec), version)
-	if err := os.RemoveAll(versionDir); err != nil {
-		return fmt.Errorf("failed to uninstall version: %w", err)
-	}
-	if currentManagedVersion(spec) == version {
-		currentDir := vpnToolCurrentDir(spec)
-		for _, b := range spec.Binaries {
-			_ = os.Remove(filepath.Join(currentDir, b))
+	for _, candidate := range listManagedVersions(spec) {
+		if candidate != version {
+			if err := setupCurrentSymlinks(spec, candidate); err != nil {
+				return err
+			}
+			return os.RemoveAll(versionDir)
 		}
 	}
-
-	remaining := listManagedVersions(spec)
-	if len(remaining) > 0 {
-		// Automatically switch to latest remaining managed version.
-		if err := setupCurrentSymlinks(spec, remaining[0]); err != nil {
+	if currentManagedVersion(spec) == version {
+		if err := os.RemoveAll(vpnToolCurrentDir(spec)); err != nil {
 			return err
 		}
 	}
-	return nil
+	return os.RemoveAll(versionDir)
 }

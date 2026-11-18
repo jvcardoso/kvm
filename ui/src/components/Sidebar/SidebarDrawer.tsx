@@ -35,13 +35,13 @@ const EnhancedDrawer: React.FC<EnhancedSidebarDrawerProps> = ({
       rootStyle={{ position: 'absolute'}}
       {...drawerProps}
       drawerRender={() => (
-        <div className={`h-full ${dark_bg2_style} !pointer-events-auto`}>
-          <div className={className}>
+        <div className={`flex h-full min-h-0 flex-col ${dark_bg2_style} !pointer-events-auto`}>
+          <div className={`${className} shrink-0`}>
             <StatsSidebarHeader title={title} setSidebarView={setSidebarView  } />
           </div>
           <div
-            className={`${className} h-full space-y-4 overflow-y-auto bg-white ${dark_bg2_style}`}>
-            <div className={`h-full ${dark_bg2_style}`}>
+            className={`${className} min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain bg-white ${dark_bg2_style}`}>
+            <div className={`min-h-full ${dark_bg2_style}`}>
               {drawerRender()}
             </div>
           </div>

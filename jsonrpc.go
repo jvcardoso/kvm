@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -100,6 +102,10 @@ func writeJSONRPCEvent(event string, params interface{}, session *Session) {
 }
 
 func DispatchRPCRequest(request JSONRPCRequest) (JSONRPCResponse, error) {
+	return dispatchRPCRequest(request, nil)
+}
+
+func dispatchRPCRequest(request JSONRPCRequest, session *Session) (JSONRPCResponse, error) {
 	// A keyboard report from the Web UI is one writer among several: without the
 	// input lease it could land in the middle of a string typed by an MCP tool
 	// and scramble the text on the remote host. keypressReport is the same kind
@@ -131,6 +137,11 @@ func DispatchRPCRequest(request JSONRPCRequest) (JSONRPCResponse, error) {
 		}, nil
 	}
 
+	if request.Method == "mountWithWebRTC" {
+		handler.Func = func(filename string, size int64, mode VirtualMediaMode, generation string) error {
+			return rpcMountWithWebRTC(session, filename, size, mode, generation)
+		}
+	}
 	result, err := callRPCHandler(handler, request.Params)
 	if err != nil {
 		return JSONRPCResponse{
@@ -179,7 +190,7 @@ func onRPCMessage(message webrtc.DataChannelMessage, session *Session) {
 
 	scopedLogger.Trace().Msg("Received RPC request")
 
-	response, _ := DispatchRPCRequest(request)
+	response, _ := dispatchRPCRequest(request, session)
 
 	if isJSONRPCNotification(request) {
 		return
@@ -203,12 +214,10 @@ func rpcGetLocalPackageInfo() (*LocalPackageInfo, error) {
 }
 
 func rpcClearLocalPackage() error {
-	otaUploadMutex.Lock()
-	defer otaUploadMutex.Unlock()
-
-	if otaState.Updating {
-		return fmt.Errorf("update already in progress")
+	if !otaUploadMutex.TryLock() {
+		return fmt.Errorf("another firmware operation is already in progress")
 	}
+	defer otaUploadMutex.Unlock()
 
 	cleanupLocalPackage()
 	return nil
@@ -248,38 +257,74 @@ func rpcReboot(force bool) error {
 	return nil
 }
 
-var streamFactor = 1.0
+// Keep encoder commands ordered across RPCs and native reconnects.
+var videoSettingsMutex sync.Mutex
+var appliedStreamFactor atomic.Uint64
+
+func setAppliedStreamFactor(factor float64) {
+	appliedStreamFactor.Store(math.Float64bits(factor))
+}
 
 func rpcGetStreamQualityFactor() (float64, error) {
-	return streamFactor, nil
+	if bits := appliedStreamFactor.Load(); bits != 0 {
+		return math.Float64frombits(bits), nil
+	}
+	return 1, nil
+}
+
+func applyAndPersistVideoSetting(path string, apply func() error, update func(*Config)) error {
+	videoSettingsMutex.Lock()
+	defer videoSettingsMutex.Unlock()
+	if err := apply(); err != nil {
+		return err
+	}
+	if err := commitConfigAt(path, update); err != nil {
+		return fmt.Errorf("video setting was applied temporarily, but saving failed: %w", err)
+	}
+	return nil
+}
+
+func changeVideoSetting(apply func() error, update func(*Config)) error {
+	if err := applyAndPersistVideoSetting(configPath, apply, update); err != nil {
+		return err
+	}
+	exportConfigSD()
+	return nil
 }
 
 func rpcSetStreamQualityFactor(factor float64) error {
-	logger.Info().Float64("factor", factor).Msg("Setting stream quality factor")
-	var _, err = CallCtrlAction("set_video_quality_factor", map[string]interface{}{"quality_factor": factor})
-	if err != nil {
-		return err
+	if factor <= 0 || math.IsNaN(factor) || math.IsInf(factor, 0) {
+		return errors.New("stream quality factor must be a positive finite number")
 	}
-
-	streamFactor = factor
-	return nil
+	return changeVideoSetting(func() error {
+		_, err := CallCtrlAction("set_video_quality_factor", map[string]interface{}{"quality_factor": factor})
+		if err == nil {
+			setAppliedStreamFactor(factor)
+		}
+		return err
+	}, func(next *Config) { next.StreamQualityFactor = factor })
 }
 
-var streamEncodecType = "avc"
+var streamUsesHEVC atomic.Bool
 
 func rpcGetStreamEncodecType() (string, error) {
-	return streamEncodecType, nil
+	if streamUsesHEVC.Load() {
+		return "hevc", nil
+	}
+	return "avc", nil
 }
 
 func rpcSetStreamEncodecType(encodecType string) error {
-	logger.Info().Str("encodecType", encodecType).Msg("Setting stream encodec type")
-	var _, err = CallCtrlAction("set_video_encodec_type", map[string]interface{}{"encodec_type": encodecType})
-	if err != nil {
-		return err
+	if encodecType != "avc" && encodecType != "hevc" {
+		return fmt.Errorf("invalid encodec type: %s", encodecType)
 	}
-
-	streamEncodecType = encodecType
-	return nil
+	return changeVideoSetting(func() error {
+		_, err := CallCtrlAction("set_video_encodec_type", map[string]interface{}{"encodec_type": encodecType})
+		if err == nil {
+			streamUsesHEVC.Store(encodecType == "hevc")
+		}
+		return err
+	}, func(next *Config) { next.StreamEncodecType = encodecType })
 }
 
 type RcQpParams struct {
@@ -303,8 +348,7 @@ type VideoRcConfigParams struct {
 	H265 RcQpParams `json:"h265"`
 }
 
-func rpcSetVideoRc(params VideoRcConfigParams) error {
-	logger.Info().Interface("params", params).Msg("Setting video RC params")
+func applyVideoRcToNative(params VideoRcConfigParams) error {
 	rcParams := map[string]interface{}{
 		"h264": map[string]interface{}{
 			"s32FirstFrameStartQp":       params.H264.S32FirstFrameStartQp,
@@ -339,6 +383,12 @@ func rpcSetVideoRc(params VideoRcConfigParams) error {
 	}
 	var _, err = CallCtrlAction("set_video_rc", rcParams)
 	return err
+}
+
+func rpcSetVideoRc(params VideoRcConfigParams) error {
+	return changeVideoSetting(func() error {
+		return applyVideoRcToNative(params)
+	}, func(next *Config) { next.VideoRc = &params })
 }
 
 func rpcGetVideoRc() (VideoRcConfigParams, error) {
@@ -407,15 +457,16 @@ func rpcSetNpuAppStatus(enable bool) error {
 		return err
 	}
 
-	config.NpuAppEnabled = enable
-	if SaveConfig() != nil {
+	if err := updateConfig(func(next *Config) {
+		next.NpuAppEnabled = enable
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
 }
 
 func rpcGetNpuAppStatus() (bool, error) {
-	return config.NpuAppEnabled, nil
+	return configSnapshot().NpuAppEnabled, nil
 }
 
 func rpcGetEDID() (string, error) {
@@ -454,8 +505,9 @@ func rpcSetEDID(edid string) error {
 	}
 
 	// Save EDID to config, allowing it to be restored on reboot.
-	config.EdidString = edid
-	_ = SaveConfig()
+	_ = updateConfig(func(next *Config) {
+		next.EdidString = edid
+	})
 	return nil
 }
 
@@ -478,8 +530,9 @@ func rpcSetForceHpd(forceHpd bool) error {
 
 	logger.Info().Bool("force_hpd", forceHpd).Msg("Force HPD setting applied")
 
-	config.ForceHpd = forceHpd
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.ForceHpd = forceHpd
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -491,10 +544,10 @@ func rpcGetForceHpd() (bool, error) {
 	data, err := os.ReadFile(forceHpdPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return config.ForceHpd, nil
+			return configSnapshot().ForceHpd, nil
 		}
 		logger.Error().Err(err).Msg("Failed to read force_hpd parameter")
-		return config.ForceHpd, fmt.Errorf("failed to read force_hpd parameter: %w", err)
+		return configSnapshot().ForceHpd, fmt.Errorf("failed to read force_hpd parameter: %w", err)
 	}
 
 	forceHpdValue := strings.TrimSpace(string(data))
@@ -504,7 +557,7 @@ func rpcGetForceHpd() (bool, error) {
 		return false, nil
 	} else {
 		logger.Warn().Str("force_hpd_value", forceHpdValue).Msg("Unexpected force_hpd value, using config value")
-		return config.ForceHpd, nil
+		return configSnapshot().ForceHpd, nil
 	}
 }
 
@@ -654,12 +707,13 @@ func sanitizeMobileVirtualMouseLayout(input MobileVirtualMouseConfig) MobileVirt
 }
 
 func rpcGetMobileVirtualMouse() (*MobileVirtualMouseConfig, error) {
-	if config.MobileVirtualMouse == nil {
+	layout := configSnapshot().MobileVirtualMouse
+	if layout == nil {
 		return defaultMobileVirtualMouseLayout(), nil
 	}
 	// The stored layout can come from a hand-edited config.json or an older build,
 	// so it is normalised on the way out as well as on the way in.
-	sanitized := sanitizeMobileVirtualMouseLayout(*config.MobileVirtualMouse)
+	sanitized := sanitizeMobileVirtualMouseLayout(*layout)
 	return &sanitized, nil
 }
 
@@ -669,15 +723,16 @@ func rpcSetMobileVirtualMouse(layout string) error {
 		return fmt.Errorf("invalid virtual mouse layout: %w", err)
 	}
 	sanitized := sanitizeMobileVirtualMouseLayout(parsed)
-	config.MobileVirtualMouse = &sanitized
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.MobileVirtualMouse = &sanitized
+	}); err != nil {
 		return fmt.Errorf("failed to save virtual mouse layout: %w", err)
 	}
 	return nil
 }
 
 func rpcGetUpdateDownloadProxy() (string, error) {
-	return config.UpdateDownloadProxy, nil
+	return configSnapshot().UpdateDownloadProxy, nil
 }
 
 func rpcSetUpdateDownloadProxy(proxy string) error {
@@ -695,8 +750,9 @@ func rpcSetUpdateDownloadProxy(proxy string) error {
 		}
 	}
 
-	config.UpdateDownloadProxy = proxy
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.UpdateDownloadProxy = proxy
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -709,8 +765,9 @@ func rpcSetDisplayRotation(params DisplayRotationSettings) error {
 	var err error
 	_, err = lvDispSetRotation(params.Rotation)
 	if err == nil {
-		config.DisplayRotation = params.Rotation
-		if err := SaveConfig(); err != nil {
+		if err := updateConfig(func(next *Config) {
+			next.DisplayRotation = params.Rotation
+		}); err != nil {
 			return fmt.Errorf("failed to save config: %w", err)
 		}
 	}
@@ -719,7 +776,7 @@ func rpcSetDisplayRotation(params DisplayRotationSettings) error {
 
 func rpcGetDisplayRotation() (*DisplayRotationSettings, error) {
 	return &DisplayRotationSettings{
-		Rotation: config.DisplayRotation,
+		Rotation: configSnapshot().DisplayRotation,
 	}, nil
 }
 
@@ -741,20 +798,20 @@ func rpcSetBacklightSettings(params BacklightSettings) error {
 		return fmt.Errorf("offAfter must be a positive integer")
 	}
 
-	config.DisplayBrightnessPercent = blConfig.MaxBrightness
-	config.DisplayDimAfterSec = blConfig.DimAfter
-	config.DisplayOffAfterSec = blConfig.OffAfter
-
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.DisplayBrightnessPercent = blConfig.MaxBrightness
+		next.DisplayDimAfterSec = blConfig.DimAfter
+		next.DisplayOffAfterSec = blConfig.OffAfter
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
 	// Keep the touchscreen backlight slider in sync with the web UI value.
 	displaySettingsMu.Lock()
-	pushBacklightToDisplay(config.DisplayBrightnessPercent)
+	pushBacklightToDisplay(configSnapshot().DisplayBrightnessPercent)
 	displaySettingsMu.Unlock()
 
-	logger.Info().Int("max_brightness", config.DisplayBrightnessPercent).Int("dim_after", config.DisplayDimAfterSec).Int("off_after", config.DisplayOffAfterSec).Msg("rpc: display: settings applied")
+	logger.Info().Int("max_brightness", configSnapshot().DisplayBrightnessPercent).Int("dim_after", configSnapshot().DisplayDimAfterSec).Int("off_after", configSnapshot().DisplayOffAfterSec).Msg("rpc: display: settings applied")
 
 	// If the device started up with auto-dim and/or auto-off set to zero, the display init
 	// method will not have started the tickers. So in case that has changed, attempt to start the tickers now.
@@ -770,9 +827,9 @@ func rpcSetBacklightSettings(params BacklightSettings) error {
 
 func rpcGetBacklightSettings() (*BacklightSettings, error) {
 	return &BacklightSettings{
-		MaxBrightness: config.DisplayBrightnessPercent,
-		DimAfter:      int(config.DisplayDimAfterSec),
-		OffAfter:      int(config.DisplayOffAfterSec),
+		MaxBrightness: configSnapshot().DisplayBrightnessPercent,
+		DimAfter:      int(configSnapshot().DisplayDimAfterSec),
+		OffAfter:      int(configSnapshot().DisplayOffAfterSec),
 	}, nil
 }
 
@@ -799,8 +856,9 @@ func rpcSetTimeZone(timeZone string) error {
 	_, err = CallDisplayCtrlAction("set_timezone", map[string]interface{}{"timezone": timeZone})
 
 	if err == nil {
-		config.TimeZone = timeZone
-		if err := SaveConfig(); err != nil {
+		if err := updateConfig(func(next *Config) {
+			next.TimeZone = timeZone
+		}); err != nil {
 			return fmt.Errorf("failed to save config: %w", err)
 		}
 	}
@@ -809,7 +867,7 @@ func rpcSetTimeZone(timeZone string) error {
 }
 
 func rpcGetTimeZone() (string, error) {
-	return config.TimeZone, nil
+	return configSnapshot().TimeZone, nil
 }
 
 const (
@@ -891,16 +949,7 @@ func rpcGetTLSState() TLSState {
 }
 
 func rpcSetTLSState(state TLSState) error {
-	err := setTLSState(state)
-	if err != nil {
-		return fmt.Errorf("failed to set TLS state: %w", err)
-	}
-
-	if err := SaveConfig(); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
-	}
-
-	return nil
+	return setTLSState(state)
 }
 
 type RPCHandler struct {
@@ -1096,17 +1145,18 @@ func rpcSetUsbEmulationState(enabled bool) error {
 
 func rpcGetUsbEnhancedDetection() (bool, error) {
 	ensureConfigLoaded()
-	return config.UsbEnhancedDetection, nil
+	return configSnapshot().UsbEnhancedDetection, nil
 }
 
 func rpcSetUsbEnhancedDetection(enabled bool) error {
 	ensureConfigLoaded()
-	if config.UsbEnhancedDetection == enabled {
+	if configSnapshot().UsbEnhancedDetection == enabled {
 		return nil
 	}
 
-	config.UsbEnhancedDetection = enabled
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.UsbEnhancedDetection = enabled
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -1119,21 +1169,23 @@ func rpcSetUsbEnhancedDetection(enabled bool) error {
 
 func rpcGetUsbConfig() (usbgadget.Config, error) {
 	LoadConfig()
-	return *config.UsbConfig, nil
+	return *configSnapshot().UsbConfig, nil
 }
 
 func rpcSetUsbConfig(usbConfig usbgadget.Config) error {
 	LoadConfig()
-	config.UsbConfig = &usbConfig
-	gadget.SetGadgetConfig(config.UsbConfig)
-	return updateUsbRelatedConfig()
+	usbConfigUpdateMutex.Lock()
+	defer usbConfigUpdateMutex.Unlock()
+	gadget.SetGadgetConfig(&usbConfig)
+	return updateUsbRelatedConfig(func(next *Config) { next.UsbConfig = &usbConfig })
 }
 
 func rpcGetWakeOnLanDevices() ([]WakeOnLanDevice, error) {
-	if config.WakeOnLanDevices == nil {
+	cfg := configSnapshot()
+	if cfg.WakeOnLanDevices == nil {
 		return []WakeOnLanDevice{}, nil
 	}
-	return config.WakeOnLanDevices, nil
+	return cfg.WakeOnLanDevices, nil
 }
 
 type SetWakeOnLanDevicesParams struct {
@@ -1141,26 +1193,52 @@ type SetWakeOnLanDevicesParams struct {
 }
 
 func rpcSetWakeOnLanDevices(params SetWakeOnLanDevicesParams) error {
-	config.WakeOnLanDevices = params.Devices
-	return SaveConfig()
+	return updateConfig(func(next *Config) {
+		next.WakeOnLanDevices = params.Devices
+	})
 }
 
 func rpcResetConfig() error {
-	loadedConfig := *defaultConfig
-	config = &loadedConfig
-	if err := SaveConfig(); err != nil {
+	authConfigMutex.Lock()
+	defer authConfigMutex.Unlock()
+	videoSettingsMutex.Lock()
+	configLock.Lock()
+	next, err := decodeConfig([]byte("{}"), false)
+	if err == nil {
+		err = writeConfig(configPath, next)
+	}
+	if err == nil {
+		configState.Store(next)
+	}
+	configLock.Unlock()
+	videoSettingsMutex.Unlock()
+	if err != nil {
 		return fmt.Errorf("failed to reset config: %w", err)
 	}
-
+	exportConfigSD()
 	logger.Info().Msg("Configuration reset to default")
 	return nil
 }
 
-func rpcGetConfigRaw() (string, error) {
-	configLock.Lock()
-	defer configLock.Unlock()
+const redactedSecretPlaceholder = "***REDACTED***"
 
-	data, err := json.MarshalIndent(config, "", "  ")
+func rpcGetConfigRaw() (string, error) {
+	cfg := configSnapshot()
+
+	if cfg == nil {
+		return "{}", nil
+	}
+
+	view := *cfg
+	if view.HashedPassword != "" {
+		view.HashedPassword = redactedSecretPlaceholder
+	}
+	view.LocalAuthToken = ""
+	if view.APIKey != "" {
+		view.APIKey = redactedSecretPlaceholder
+	}
+
+	data, err := json.MarshalIndent(&view, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal config: %w", err)
 	}
@@ -1169,20 +1247,38 @@ func rpcGetConfigRaw() (string, error) {
 }
 
 func rpcSetConfigRaw(configStr string) error {
-	var newConfig Config
-	if err := json.Unmarshal([]byte(configStr), &newConfig); err != nil {
-		return fmt.Errorf("failed to unmarshal config: %w", err)
-	}
-
+	videoSettingsMutex.Lock()
 	configLock.Lock()
-	config = &newConfig
+	err := replaceRawConfigLocked(configPath, []byte(configStr))
 	configLock.Unlock()
+	videoSettingsMutex.Unlock()
+	if err != nil {
+		return err
+	}
+	exportConfigSD()
+	logger.Info().Msg("Configuration updated via raw JSON")
+	return nil
+}
 
-	if err := SaveConfig(); err != nil {
+func replaceRawConfigLocked(path string, raw []byte) error {
+	cfg := configSnapshot()
+	next, err := decodeConfig(raw, true)
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	if next.StreamQualityFactor <= 0 || (next.StreamEncodecType != "avc" && next.StreamEncodecType != "hevc") {
+		return errors.New("invalid encoder settings")
+	}
+	if cfg != nil {
+		next.HashedPassword = cfg.HashedPassword
+		next.LocalAuthMode = cfg.LocalAuthMode
+		next.LocalAuthToken = cfg.LocalAuthToken
+		next.APIKey = cfg.APIKey
+	}
+	if err := writeConfig(path, next); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
-
-	logger.Info().Msg("Configuration updated via raw JSON")
+	configState.Store(next)
 	return nil
 }
 
@@ -1193,16 +1289,18 @@ type RtcServersConfig struct {
 }
 
 func rpcGetRtcServersConfig() (RtcServersConfig, error) {
+	cfg := configSnapshot()
 	return RtcServersConfig{
-		STUN:        config.STUN,
+		STUN:        cfg.STUN,
 		DefaultSTUN: DefaultSTUN,
-		TurnServers: config.TurnServers,
+		TurnServers: cfg.TurnServers,
 	}, nil
 }
 
 func rpcSetStunServer(stun string) error {
-	config.STUN = stun
-	return SaveConfig()
+	return updateConfig(func(next *Config) {
+		next.STUN = stun
+	})
 }
 
 type SetTurnServersParams struct {
@@ -1210,11 +1308,11 @@ type SetTurnServersParams struct {
 }
 
 func rpcSetTurnServers(params SetTurnServersParams) error {
-	config.TurnServers = params.Servers
-	if config.TurnServers == nil {
-		config.TurnServers = []TurnServer{}
+	servers := params.Servers
+	if servers == nil {
+		servers = []TurnServer{}
 	}
-	return SaveConfig()
+	return updateConfig(func(next *Config) { next.TurnServers = servers })
 }
 
 type IceServerJSON struct {
@@ -1241,15 +1339,16 @@ func rpcGetIceServers() ([]IceServerJSON, error) {
 }
 
 func rpcGetActiveExtension() (string, error) {
-	return config.ActiveExtension, nil
+	return configSnapshot().ActiveExtension, nil
 }
 
 func rpcSetActiveExtension(extensionId string) error {
-	if config.ActiveExtension == extensionId {
+	if configSnapshot().ActiveExtension == extensionId {
 		return nil
 	}
-	config.ActiveExtension = extensionId
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.ActiveExtension = extensionId
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -1264,15 +1363,16 @@ type SerialSettings struct {
 }
 
 func rpcGetSerialSettings() (SerialSettings, error) {
+	mode := serialModeSnapshot()
 	settings := SerialSettings{
-		BaudRate:  strconv.Itoa(serialPortMode.BaudRate),
-		DataBits:  strconv.Itoa(serialPortMode.DataBits),
+		BaudRate:  strconv.Itoa(mode.BaudRate),
+		DataBits:  strconv.Itoa(mode.DataBits),
 		StopBits:  "1",
 		Parity:    "none",
 		Connected: getSerialPort() != nil,
 	}
 
-	switch serialPortMode.StopBits {
+	switch mode.StopBits {
 	case serial.OneStopBit:
 		settings.StopBits = "1"
 	case serial.OnePointFiveStopBits:
@@ -1281,7 +1381,7 @@ func rpcGetSerialSettings() (SerialSettings, error) {
 		settings.StopBits = "2"
 	}
 
-	switch serialPortMode.Parity {
+	switch mode.Parity {
 	case serial.NoParity:
 		settings.Parity = "none"
 	case serial.OddParity:
@@ -1297,35 +1397,44 @@ func rpcGetSerialSettings() (SerialSettings, error) {
 	return settings, nil
 }
 
-var serialPortMode = defaultMode
+var serialModeState atomic.Pointer[serial.Mode]
+var serialSettingsMutex sync.Mutex
+
+func serialModeSnapshot() *serial.Mode {
+	if mode := serialModeState.Load(); mode != nil {
+		return mode
+	}
+	return defaultMode
+}
 
 // serialPortEnabled is the persisted user intent. When true the port is opened
 // on boot and stays open across page reloads until the user disconnects it.
-var serialPortEnabled bool
+var serialPortEnabled atomic.Bool
 
-// loadSerialSettingsFromConfig loads serial port settings from config into serialPortMode.
+// loadSerialSettingsFromConfig loads serial port settings from config into serialModeSnapshot().
 // Called during LoadConfig to restore persisted settings.
 func loadSerialSettingsFromConfig() {
-	if config == nil {
+	cfg := configSnapshot()
+	if cfg == nil {
 		return
 	}
 
-	serialPortEnabled = config.SerialPortEnabled
+	serialPortEnabled.Store(cfg.SerialPortEnabled)
 
 	// Only apply if config has serial settings saved (non-zero baud rate)
-	if config.SerialBaudRate == 0 {
+	if cfg.SerialBaudRate == 0 {
 		logger.Debug().Msg("no serial settings in config, using defaults")
 		return
 	}
 
-	baudRate := config.SerialBaudRate
-	dataBits := config.SerialDataBits
+	baudRate := cfg.SerialBaudRate
+	dataBits := cfg.SerialDataBits
 	if dataBits == 0 {
 		dataBits = 8
 	}
 
 	var stopBits serial.StopBits
-	switch config.SerialStopBits {
+	switch cfg.SerialStopBits {
 	case "1.5":
 		stopBits = serial.OnePointFiveStopBits
 	case "2":
@@ -1335,7 +1444,7 @@ func loadSerialSettingsFromConfig() {
 	}
 
 	var parity serial.Parity
-	switch config.SerialParity {
+	switch cfg.SerialParity {
 	case "odd":
 		parity = serial.OddParity
 	case "even":
@@ -1348,29 +1457,30 @@ func loadSerialSettingsFromConfig() {
 		parity = serial.NoParity
 	}
 
-	serialPortMode = &serial.Mode{
+	serialModeState.Store(&serial.Mode{
 		BaudRate: baudRate,
 		DataBits: dataBits,
 		StopBits: stopBits,
 		Parity:   parity,
-	}
+	})
 
 	logger.Info().
 		Int("baud_rate", baudRate).
 		Int("data_bits", dataBits).
-		Str("stop_bits", config.SerialStopBits).
-		Str("parity", config.SerialParity).
+		Str("stop_bits", cfg.SerialStopBits).
+		Str("parity", cfg.SerialParity).
 		Msg("serial settings loaded from config")
 }
 
 // saveSerialSettingsToConfig saves current serial port settings to config and persists to disk.
 func saveSerialSettingsToConfig() error {
-	if config == nil {
+	mode := serialModeSnapshot()
+	if configSnapshot() == nil {
 		return fmt.Errorf("config not loaded")
 	}
 
 	var stopBits string
-	switch serialPortMode.StopBits {
+	switch mode.StopBits {
 	case serial.OnePointFiveStopBits:
 		stopBits = "1.5"
 	case serial.TwoStopBits:
@@ -1380,7 +1490,7 @@ func saveSerialSettingsToConfig() error {
 	}
 
 	var parity string
-	switch serialPortMode.Parity {
+	switch mode.Parity {
 	case serial.OddParity:
 		parity = "odd"
 	case serial.EvenParity:
@@ -1393,19 +1503,19 @@ func saveSerialSettingsToConfig() error {
 		parity = "none"
 	}
 
-	config.SerialBaudRate = serialPortMode.BaudRate
-	config.SerialDataBits = serialPortMode.DataBits
-	config.SerialStopBits = stopBits
-	config.SerialParity = parity
-	config.SerialPortEnabled = serialPortEnabled
-
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.SerialBaudRate = mode.BaudRate
+		next.SerialDataBits = mode.DataBits
+		next.SerialStopBits = stopBits
+		next.SerialParity = parity
+		next.SerialPortEnabled = serialPortEnabled.Load()
+	}); err != nil {
 		return fmt.Errorf("failed to save serial settings: %w", err)
 	}
 
 	logger.Info().
-		Int("baud_rate", serialPortMode.BaudRate).
-		Int("data_bits", serialPortMode.DataBits).
+		Int("baud_rate", mode.BaudRate).
+		Int("data_bits", mode.DataBits).
 		Str("stop_bits", stopBits).
 		Str("parity", parity).
 		Msg("serial settings saved to config")
@@ -1414,6 +1524,8 @@ func saveSerialSettingsToConfig() error {
 }
 
 func rpcSetSerialSettings(settings SerialSettings) error {
+	serialSettingsMutex.Lock()
+	defer serialSettingsMutex.Unlock()
 	logger.Info().
 		Str("baud_rate", settings.BaudRate).
 		Str("data_bits", settings.DataBits).
@@ -1462,12 +1574,12 @@ func rpcSetSerialSettings(settings SerialSettings) error {
 		return fmt.Errorf("invalid parity: %s", settings.Parity)
 	}
 
-	serialPortMode = &serial.Mode{
+	serialModeState.Store(&serial.Mode{
 		BaudRate: baudRate,
 		DataBits: dataBits,
 		StopBits: stopBits,
 		Parity:   parity,
-	}
+	})
 
 	logger.Info().
 		Int("baud_rate", baudRate).
@@ -1483,7 +1595,7 @@ func rpcSetSerialSettings(settings SerialSettings) error {
 	}
 
 	if p := getSerialPort(); p != nil {
-		if err := p.SetMode(serialPortMode); err != nil {
+		if err := p.SetMode(serialModeSnapshot()); err != nil {
 			logger.Error().Err(err).Msg("failed to set port mode")
 		} else {
 			logger.Info().Msg("port mode updated successfully")
@@ -1497,9 +1609,11 @@ func rpcSetSerialSettings(settings SerialSettings) error {
 
 // rpcConnectSerial opens the serial port with current settings
 func rpcConnectSerial() error {
+	serialSettingsMutex.Lock()
+	defer serialSettingsMutex.Unlock()
 	logger.Info().
-		Int("baud_rate", serialPortMode.BaudRate).
-		Int("data_bits", serialPortMode.DataBits).
+		Int("baud_rate", serialModeSnapshot().BaudRate).
+		Int("data_bits", serialModeSnapshot().DataBits).
 		Msg("rpcConnectSerial called")
 
 	// Only open when closed: a forced reopen would discard the bytes the kernel
@@ -1510,7 +1624,7 @@ func rpcConnectSerial() error {
 	}
 
 	// Persist the intent so page reloads and reboots keep the port open.
-	serialPortEnabled = true
+	serialPortEnabled.Store(true)
 	if err := saveSerialSettingsToConfig(); err != nil {
 		logger.Warn().Err(err).Msg("failed to persist serial port enabled state")
 	}
@@ -1521,6 +1635,8 @@ func rpcConnectSerial() error {
 
 // rpcDisconnectSerial closes the serial port
 func rpcDisconnectSerial() error {
+	serialSettingsMutex.Lock()
+	defer serialSettingsMutex.Unlock()
 	logger.Info().Msg("rpcDisconnectSerial called")
 
 	if getSerialPort() != nil {
@@ -1531,7 +1647,7 @@ func rpcDisconnectSerial() error {
 	}
 
 	// Clear the intent so the port is not reopened after a reload or a reboot.
-	serialPortEnabled = false
+	serialPortEnabled.Store(false)
 	if err := saveSerialSettingsToConfig(); err != nil {
 		logger.Warn().Err(err).Msg("failed to persist serial port enabled state")
 	}
@@ -1540,17 +1656,16 @@ func rpcDisconnectSerial() error {
 }
 
 func rpcGetUsbDevices() (usbgadget.Devices, error) {
-	return *config.UsbDevices, nil
+	return *configSnapshot().UsbDevices, nil
 }
 
-func updateUsbRelatedConfig() error {
+var usbConfigUpdateMutex sync.Mutex
+
+func updateUsbRelatedConfig(edit func(*Config)) error {
 	if err := gadget.UpdateGadgetConfig(); err != nil {
 		return fmt.Errorf("failed to write gadget config: %w", err)
 	}
-	if err := SaveConfig(); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
-	}
-	return nil
+	return updateConfig(edit)
 }
 
 func rpcSetUsbDevices(usbDevices usbgadget.Devices) error {
@@ -1561,38 +1676,42 @@ func rpcSetUsbDevices(usbDevices usbgadget.Devices) error {
 			jsonRpcLogger.Error().Err(err).Msg("failed to unmount image")
 		}
 	}
-	config.UsbDevices = &usbDevices
-	gadget.SetGadgetDevices(config.UsbDevices)
-	return updateUsbRelatedConfig()
+	usbConfigUpdateMutex.Lock()
+	defer usbConfigUpdateMutex.Unlock()
+	gadget.SetGadgetDevices(&usbDevices)
+	return updateUsbRelatedConfig(func(next *Config) { next.UsbDevices = &usbDevices })
 }
 
 func rpcSetUsbDeviceState(device string, enabled bool) error {
+	usbConfigUpdateMutex.Lock()
+	defer usbConfigUpdateMutex.Unlock()
+	devices := *configSnapshot().UsbDevices
 	switch device {
 	case "absoluteMouse":
-		config.UsbDevices.AbsoluteMouse = enabled
+		devices.AbsoluteMouse = enabled
 	case "relativeMouse":
-		config.UsbDevices.RelativeMouse = enabled
+		devices.RelativeMouse = enabled
 	case "keyboard":
-		config.UsbDevices.Keyboard = enabled
+		devices.Keyboard = enabled
 	case "massStorage":
-		config.UsbDevices.MassStorage = enabled
+		devices.MassStorage = enabled
 	default:
 		return fmt.Errorf("invalid device: %s", device)
 	}
-	gadget.SetGadgetDevices(config.UsbDevices)
-	return updateUsbRelatedConfig()
+	gadget.SetGadgetDevices(&devices)
+	return updateUsbRelatedConfig(func(next *Config) { next.UsbDevices = &devices })
 }
 
 func rpcGetKeyboardLayout() (string, error) {
-	return config.KeyboardLayout, nil
+	cfg := configSnapshot()
+	if cfg == nil {
+		return "", errors.New("config has not been loaded")
+	}
+	return cfg.KeyboardLayout, nil
 }
 
 func rpcSetKeyboardLayout(layout string) error {
-	config.KeyboardLayout = layout
-	if err := SaveConfig(); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
-	}
-	return nil
+	return updateConfig(func(next *Config) { next.KeyboardLayout = layout })
 }
 
 // keyboardFormFactors are the physical key arrangements the on-screen keyboard
@@ -1604,19 +1723,20 @@ var keyboardFormFactors = map[string]bool{"ANSI": true, "ISO": true, "JIS": true
 func rpcGetKeyboardFormFactor() (string, error) {
 	// Configs written before this setting existed have an empty value; ANSI is
 	// both the default and the shape those configs were rendered with.
-	if !keyboardFormFactors[config.KeyboardFormFactor] {
+	if !keyboardFormFactors[configSnapshot().KeyboardFormFactor] {
 		return "ANSI", nil
 	}
-	return config.KeyboardFormFactor, nil
+	return configSnapshot().KeyboardFormFactor, nil
 }
 
 func rpcSetKeyboardFormFactor(formFactor string) error {
 	if !keyboardFormFactors[formFactor] {
 		return fmt.Errorf("invalid keyboard form factor %q, expected ANSI, ISO or JIS", formFactor)
 	}
-	previous := config.KeyboardFormFactor
-	config.KeyboardFormFactor = formFactor
-	if err := SaveConfig(); err != nil {
+	previous := configSnapshot().KeyboardFormFactor
+	if err := updateConfig(func(next *Config) {
+		next.KeyboardFormFactor = formFactor
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -1760,8 +1880,8 @@ func rpcExecuteKeyboardMacro(session *Session, task *hidMacroTask, report hidrpc
 }
 
 func getKeyboardMacros() (interface{}, error) {
-	macros := make([]KeyboardMacro, len(config.KeyboardMacros))
-	copy(macros, config.KeyboardMacros)
+	macros := make([]KeyboardMacro, len(configSnapshot().KeyboardMacros))
+	copy(macros, configSnapshot().KeyboardMacros)
 
 	return macros, nil
 }
@@ -1843,9 +1963,9 @@ func setKeyboardMacros(params KeyboardMacrosParams) (interface{}, error) {
 		newMacros = append(newMacros, macro)
 	}
 
-	config.KeyboardMacros = newMacros
-
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.KeyboardMacros = newMacros
+	}); err != nil {
 		return nil, err
 	}
 
@@ -1853,18 +1973,19 @@ func setKeyboardMacros(params KeyboardMacrosParams) (interface{}, error) {
 }
 
 func rpcGetLocalLoopbackOnly() (bool, error) {
-	return config.LocalLoopbackOnly, nil
+	return configSnapshot().LocalLoopbackOnly, nil
 }
 
 func rpcSetLocalLoopbackOnly(enabled bool) error {
 	// Check if the setting is actually changing
-	if config.LocalLoopbackOnly == enabled {
+	if configSnapshot().LocalLoopbackOnly == enabled {
 		return nil
 	}
 
 	// Update the setting
-	config.LocalLoopbackOnly = enabled
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.LocalLoopbackOnly = enabled
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -1872,12 +1993,13 @@ func rpcSetLocalLoopbackOnly(enabled bool) error {
 }
 
 func rpcGetApiKey() (string, error) {
-	return config.APIKey, nil
+	return configSnapshot().APIKey, nil
 }
 
 func rpcSetApiKey(apiKey string) error {
-	config.APIKey = apiKey
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.APIKey = apiKey
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	// publish to the running MCP server, otherwise the new key only works after a restart
@@ -1890,8 +2012,9 @@ func rpcGenerateApiKey() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to generate API key: %w", err)
 	}
-	config.APIKey = key
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.APIKey = key
+	}); err != nil {
 		return "", fmt.Errorf("failed to save config: %w", err)
 	}
 	mcp.ApplyAPIKey(key)
@@ -1906,8 +2029,8 @@ type IOSettings struct {
 func rpcGetIOSettings() (IOSettings, error) {
 	LoadConfig()
 	settings := IOSettings{
-		IO0Status: config.IO0Status,
-		IO1Status: config.IO1Status,
+		IO0Status: configSnapshot().IO0Status,
+		IO1Status: configSnapshot().IO1Status,
 	}
 
 	return settings, nil
@@ -1921,9 +2044,10 @@ func rpcSetIOSettings(settings IOSettings) error {
 	_ = setGPIOValue(58, settings.IO0Status)
 	_ = setGPIOValue(59, settings.IO1Status)
 
-	config.IO0Status = settings.IO0Status
-	config.IO1Status = settings.IO1Status
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.IO0Status = settings.IO0Status
+		next.IO1Status = settings.IO1Status
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -1951,8 +2075,31 @@ func rpcSetIOStatus(ioName string, status bool) error {
 
 func rpcTriggerPower() error {
 	go func() {
-		if err := pulseGPIO(58, 2*time.Second); err != nil {
-			logger.Error().Err(err).Msg("Failed to trigger power pulse")
+		if err := pulseGPIO(58, 500*time.Millisecond); err != nil {
+			logger.Error().Err(err).Msg("Failed to trigger short power pulse")
+		}
+	}()
+	return nil
+}
+
+func rpcTriggerForcePower() error {
+	go func() {
+		if err := pulseGPIO(58, 5*time.Second); err != nil {
+			logger.Error().Err(err).Msg("Failed to trigger long force-power pulse")
+		}
+	}()
+	return nil
+}
+
+func rpcTriggerPowerPulse(durationMs int) error {
+	if durationMs < 100 {
+		durationMs = 100
+	} else if durationMs > 10000 {
+		durationMs = 10000
+	}
+	go func() {
+		if err := pulseGPIO(58, time.Duration(durationMs)*time.Millisecond); err != nil {
+			logger.Error().Err(err).Int("durationMs", durationMs).Msg("Failed to trigger custom power pulse")
 		}
 	}()
 	return nil
@@ -1960,7 +2107,7 @@ func rpcTriggerPower() error {
 
 func rpcTriggerReset() error {
 	go func() {
-		if err := pulseGPIO(59, 2*time.Second); err != nil {
+		if err := pulseGPIO(59, 500*time.Millisecond); err != nil {
 			logger.Error().Err(err).Msg("Failed to trigger reset pulse")
 		}
 	}()
@@ -1997,16 +2144,17 @@ func rpcGetIOInputStatus() (map[string]bool, error) {
 }
 
 func rpcGetAudioMode() (string, error) {
-	return config.AudioMode, nil
+	return configSnapshot().AudioMode, nil
 }
 
 func rpcSetAudioMode(mode string) error {
-	config.AudioMode = mode
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.AudioMode = mode
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
-	if config.AudioMode != "disabled" {
+	if configSnapshot().AudioMode != "disabled" {
 		StartNtpAudioServer(handleAudioClient)
 	} else {
 		StopNtpAudioServer()
@@ -2021,8 +2169,9 @@ func rpcSetLedGreenMode(mode string) error {
 		return err
 	}
 
-	config.LEDGreenMode = mode
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.LEDGreenMode = mode
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -2034,44 +2183,39 @@ func rpcSetLedYellowMode(mode string) error {
 		return err
 	}
 
-	config.LEDYellowMode = mode
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.LEDYellowMode = mode
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
 }
 
 func rpcGetLedGreenMode() (string, error) {
-	return config.LEDGreenMode, nil
+	return configSnapshot().LEDGreenMode, nil
 }
 
 func rpcGetLedYellowMode() (string, error) {
-	return config.LEDYellowMode, nil
+	return configSnapshot().LEDYellowMode, nil
 }
 func rpcGetAutoMountImage() (*AutoMountImageConfig, error) {
-	return config.AutoMountImage, nil
+	return configSnapshot().AutoMountImage, nil
 }
 
 func rpcSetAutoMountImage(filename string, source string) error {
-	if filename == "" {
-		// Disabling auto-mount must also drop the persisted virtual media entry for
-		// the same image, otherwise remountPersistedVirtualMediaState brings it back
-		// on the next boot.
-		clearPersistedAutoMountState(config.AutoMountImage, config.PersistedVirtualMediaState)
-		config.AutoMountImage = nil
-	} else {
-		if source != "kvm" && source != "sd" {
-			return fmt.Errorf("invalid source: %s, must be 'kvm' or 'sd'", source)
-		}
-		config.AutoMountImage = &AutoMountImageConfig{
-			Filename: filename,
-			Source:   source,
-		}
+	if filename != "" && source != "kvm" && source != "sd" {
+		return fmt.Errorf("invalid source: %s, must be 'kvm' or 'sd'", source)
 	}
-	if err := SaveConfig(); err != nil {
-		return fmt.Errorf("failed to save config: %w", err)
-	}
-	return nil
+	return updateConfig(func(next *Config) {
+		if filename == "" {
+			if matchesAutoMount(next.AutoMountImage, next.PersistedVirtualMediaState) {
+				next.PersistedVirtualMediaState = nil
+			}
+			next.AutoMountImage = nil
+		} else {
+			next.AutoMountImage = &AutoMountImageConfig{Filename: filename, Source: source}
+		}
+	})
 }
 
 func rpcGetFirewallConfig() (FirewallConfig, error) {
@@ -2079,10 +2223,10 @@ func rpcGetFirewallConfig() (FirewallConfig, error) {
 	if systemCfg, err := ReadFirewallConfigFromSystem(); err == nil && systemCfg != nil {
 		return *systemCfg, nil
 	}
-	if config.Firewall == nil {
-		return *defaultConfig.Firewall, nil
+	if cfg := configSnapshot().Firewall; cfg != nil {
+		return *cfg, nil
 	}
-	return *config.Firewall, nil
+	return *defaultConfig.Firewall, nil
 }
 
 func rpcSetFirewallConfig(firewallCfg FirewallConfig) error {
@@ -2092,8 +2236,9 @@ func rpcSetFirewallConfig(firewallCfg FirewallConfig) error {
 	if err := ApplyFirewallConfig(&managedCfg); err != nil {
 		return err
 	}
-	config.Firewall = &managedCfg
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.Firewall = &managedCfg
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -2399,7 +2544,7 @@ var rpcHandlers = map[string]RPCHandler{
 	"unmountSDStorage":         {Func: rpcUnmountSDStorage},
 	"formatSDStorage":          {Func: rpcFormatSDStorage, Params: []string{"confirm", "fsType"}},
 	"mountWithHTTP":            {Func: rpcMountWithHTTP, Params: []string{"url", "mode"}},
-	"mountWithWebRTC":          {Func: rpcMountWithWebRTC, Params: []string{"filename", "size", "mode"}},
+	"mountWithWebRTC":          {Params: []string{"filename", "size", "mode", "generation"}},
 	"mountWithStorage":         {Func: rpcMountWithStorage, Params: []string{"filename", "mode"}},
 	"mountWithSDStorage":       {Func: rpcMountWithSDStorage, Params: []string{"filename", "mode"}},
 	"setAutoMountImage":        {Func: rpcSetAutoMountImage, Params: []string{"filename", "source"}},
@@ -2452,6 +2597,8 @@ var rpcHandlers = map[string]RPCHandler{
 	"getIOSettings":            {Func: rpcGetIOSettings},
 	"setIOSettings":            {Func: rpcSetIOSettings, Params: []string{"settings"}},
 	"triggerPower":             {Func: rpcTriggerPower},
+	"triggerForcePower":        {Func: rpcTriggerForcePower},
+	"triggerPowerPulse":        {Func: rpcTriggerPowerPulse, Params: []string{"durationMs"}},
 	"triggerReset":             {Func: rpcTriggerReset},
 	"setIOStatus":              {Func: rpcSetIOStatus, Params: []string{"ioName", "status"}},
 	"getIOInputStatus":         {Func: rpcGetIOInputStatus},

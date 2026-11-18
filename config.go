@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"kvm/internal/logging"
 	"kvm/internal/network"
@@ -155,13 +157,16 @@ type Config struct {
 	SerialPortEnabled          bool                   `json:"serial_port_enabled,omitempty"` // user intent: keep the serial port open across reloads and reboots
 	// MobileVirtualMouse holds the mobile virtual mouse overlay layout so the
 	// widget positions survive reloads and are shared by every browser.
-	MobileVirtualMouse *MobileVirtualMouseConfig `json:"mobile_virtual_mouse,omitempty"`
+	MobileVirtualMouse  *MobileVirtualMouseConfig `json:"mobile_virtual_mouse,omitempty"`
+	StreamQualityFactor float64                   `json:"stream_quality_factor,omitempty"`
+	StreamEncodecType   string                    `json:"stream_encodec_type,omitempty"`
+	VideoRc             *VideoRcConfigParams      `json:"video_rc,omitempty"`
 }
 
 // MobileVirtualMouseConfig is the persisted virtual mouse overlay layout.
 type MobileVirtualMouseConfig struct {
-	Enabled bool    `json:"enabled"` // master switch: show the widgets at all
-	Speed   float64 `json:"speed"`   // joystick speed multiplier
+	Enabled bool                                `json:"enabled"` // master switch: show the widgets at all
+	Speed   float64                             `json:"speed"`   // joystick speed multiplier
 	Widgets map[string]MobileVirtualMouseWidget `json:"widgets"`
 }
 
@@ -284,6 +289,8 @@ var defaultConfig = &Config{
 	AutoMountImage:       &AutoMountImageConfig{Filename: systemInfoImageFilename, Source: "kvm"},
 	WireguardAutoStart:   false,
 	NpuAppEnabled:        false,
+	StreamQualityFactor:  1.0,
+	StreamEncodecType:    "avc",
 	Firewall: &FirewallConfig{
 		Base: FirewallBaseRule{
 			InputPolicy:   "accept",
@@ -296,8 +303,8 @@ var defaultConfig = &Config{
 }
 
 var (
-	config     *Config
-	configLock = &sync.Mutex{}
+	configState atomic.Pointer[Config]
+	configLock  = &sync.Mutex{}
 )
 
 type ConfigMigrationFunc func(raw json.RawMessage) (json.RawMessage, error)
@@ -312,8 +319,8 @@ var configMigrations = []ConfigMigrationFunc{
 // block only, while byte 126 still announced one extension block) with the full
 // 256-byte default. A custom EDID set by the user is left untouched.
 func migrateLegacyTruncatedEdid(raw json.RawMessage) (json.RawMessage, error) {
-	var rawMap map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &rawMap); err != nil {
+	rawMap, err := parseConfigObject(raw)
+	if err != nil {
 		return nil, fmt.Errorf("migrateLegacyTruncatedEdid: failed to parse config JSON: %w", err)
 	}
 
@@ -342,8 +349,8 @@ func migrateLegacyTruncatedEdid(raw json.RawMessage) (json.RawMessage, error) {
 // (display_max_brightness, 0-200) with a percentage (display_brightness_percent),
 // so the web UI, the touchscreen slider and the config all share one unit.
 func migrateDisplayBrightnessPercent(raw json.RawMessage) (json.RawMessage, error) {
-	var rawMap map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &rawMap); err != nil {
+	rawMap, err := parseConfigObject(raw)
+	if err != nil {
 		return nil, fmt.Errorf("migrateDisplayBrightnessPercent: failed to parse config JSON: %w", err)
 	}
 
@@ -381,8 +388,8 @@ func migrateDisplayBrightnessPercent(raw json.RawMessage) (json.RawMessage, erro
 }
 
 func migrateLocalAuthMode(raw json.RawMessage) (json.RawMessage, error) {
-	var rawMap map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &rawMap); err != nil {
+	rawMap, err := parseConfigObject(raw)
+	if err != nil {
 		return nil, fmt.Errorf("migrateLocalAuthMode: failed to parse config JSON: %w", err)
 	}
 
@@ -408,6 +415,9 @@ func migrateLocalAuthMode(raw json.RawMessage) (json.RawMessage, error) {
 }
 
 func runMigrations(raw json.RawMessage) (json.RawMessage, bool, error) {
+	if _, err := parseConfigObject(raw); err != nil {
+		return raw, false, err
+	}
 	current := raw
 	didMigrate := false
 	for i, migration := range configMigrations {
@@ -425,33 +435,122 @@ func runMigrations(raw json.RawMessage) (json.RawMessage, bool, error) {
 }
 
 func writeRawConfig(path string, raw json.RawMessage) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("failed to create config file: %w", err)
-	}
-	defer file.Close()
-
 	var indented bytes.Buffer
 	if err := json.Indent(&indented, raw, "", "  "); err != nil {
-		return fmt.Errorf("failed to indent config JSON: %w", err)
+		return fmt.Errorf("invalid config JSON: %w", err)
 	}
-
+	file, err := os.CreateTemp(filepath.Dir(path), ".kvm-config-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
 	if _, err := indented.WriteTo(file); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
+		return err
 	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
+}
 
-	return nil
+func parseConfigObject(raw []byte) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	if fields == nil {
+		return nil, errors.New("configuration must be a JSON object")
+	}
+	return fields, nil
+}
+
+func decodeConfig(raw []byte, requireObjects bool) (*Config, error) {
+	if _, err := parseConfigObject(raw); err != nil {
+		return nil, err
+	}
+	// Clone the defaults before decoding so a partial or invalid nested object
+	// cannot mutate the defaults or the live configuration.
+	defaults, err := json.Marshal(defaultConfig)
+	if err != nil {
+		return nil, err
+	}
+	var next Config
+	if err := json.Unmarshal(defaults, &next); err != nil {
+		return nil, err
+	}
+	fallback := next
+	if err := json.Unmarshal(raw, &next); err != nil {
+		return nil, err
+	}
+	if next.UsbConfig == nil {
+		if requireObjects {
+			return nil, errors.New("usb_config must be an object")
+		}
+		next.UsbConfig = fallback.UsbConfig
+	}
+	if next.UsbDevices == nil {
+		if requireObjects {
+			return nil, errors.New("usb_devices must be an object")
+		}
+		next.UsbDevices = fallback.UsbDevices
+	}
+	if next.NetworkConfig == nil {
+		if requireObjects {
+			return nil, errors.New("network_config must be an object")
+		}
+		next.NetworkConfig = fallback.NetworkConfig
+	}
+	if next.Firewall == nil {
+		if requireObjects {
+			return nil, errors.New("firewall must be an object")
+		}
+		next.Firewall = fallback.Firewall
+	}
+	return &next, nil
+}
+
+func loadConfigFile(path string) (loaded *Config, migrated bool, err error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	updated, changed, err := runMigrations(raw)
+	if err == nil {
+		loaded, err = decodeConfig(updated, false)
+	}
+	if err != nil {
+		if backupErr := os.Rename(path, path+".corrupt"); backupErr != nil {
+			logger.Warn().Err(backupErr).Msg("failed to preserve invalid config")
+		}
+		return nil, false, err
+	}
+	if changed {
+		if err := writeRawConfig(path, updated); err != nil {
+			logger.Warn().Err(err).Msg("failed to persist migrated config")
+		} else {
+			migrated = true
+		}
+	}
+	return loaded, migrated, nil
 }
 
 func LoadConfig() {
 	configLock.Lock()
-	defer configLock.Unlock()
+	var migrated bool
+	defer func() {
+		configLock.Unlock()
+		if migrated {
+			exportConfigSD()
+		}
+	}()
 
-	if config != nil {
-		logger.Debug().Msg("config already loaded, skipping")
+	if configSnapshot() != nil {
 		return
 	}
-
 	if defaultConfig.UsbConfig.SerialNumber == "" {
 		serialNumber, err := extractSerialNumber()
 		if err != nil {
@@ -460,68 +559,30 @@ func LoadConfig() {
 			defaultConfig.UsbConfig.SerialNumber = serialNumber
 		}
 	}
-	loadedConfig := *defaultConfig
-	config = &loadedConfig
-
-	rawData, err := os.ReadFile(configPath)
+	loaded, changed, err := loadConfigFile(configPath)
+	migrated = changed
 	if err != nil {
-		logger.Debug().Msg("config file does not exist, using default")
-		return
-	}
-
-	migrated, didMigrate, err := runMigrations(json.RawMessage(rawData))
-	if err != nil {
-		logger.Warn().Err(err).Msg("config migration failed, preserving corrupt file")
-		corruptPath := configPath + ".corrupt"
-		_ = os.Rename(configPath, corruptPath)
-		logger.Info().Str("corrupt_path", corruptPath).Msg("corrupt config preserved for diagnosis")
-		return
-	}
-
-	if didMigrate {
-		if writeErr := writeRawConfig(configPath, migrated); writeErr != nil {
-			logger.Warn().Err(writeErr).Msg("failed to write migrated config, continuing with in-memory version")
-		} else {
-			logger.Info().Msg("migrated config saved to disk")
-			SyncConfigSD(false)
+		if !os.IsNotExist(err) {
+			logger.Warn().Err(err).Msg("failed to load config, using defaults")
 		}
+		loaded = new(Config)
+		*loaded = *defaultConfig
+	}
+	if loaded.TurnServers == nil {
+		loaded.TurnServers = []TurnServer{}
+	}
+	if loaded.StreamQualityFactor <= 0 {
+		loaded.StreamQualityFactor = defaultConfig.StreamQualityFactor
+	}
+	if loaded.StreamEncodecType != "avc" && loaded.StreamEncodecType != "hevc" {
+		loaded.StreamEncodecType = defaultConfig.StreamEncodecType
 	}
 
-	if err := json.Unmarshal(migrated, &loadedConfig); err != nil {
-		logger.Warn().Err(err).Msg("config file JSON parsing failed, preserving corrupt file")
-		corruptPath := configPath + ".corrupt"
-		_ = os.Rename(configPath, corruptPath)
-		logger.Info().Str("corrupt_path", corruptPath).Msg("corrupt config preserved for diagnosis")
-		return
-	}
-
-	if loadedConfig.UsbConfig == nil {
-		loadedConfig.UsbConfig = defaultConfig.UsbConfig
-	}
-
-	if loadedConfig.UsbDevices == nil {
-		loadedConfig.UsbDevices = defaultConfig.UsbDevices
-	}
-
-	if loadedConfig.NetworkConfig == nil {
-		loadedConfig.NetworkConfig = defaultConfig.NetworkConfig
-	}
-
-	if loadedConfig.Firewall == nil {
-		loadedConfig.Firewall = defaultConfig.Firewall
-	}
-
-	if loadedConfig.TurnServers == nil {
-		loadedConfig.TurnServers = []TurnServer{}
-	}
-
-	config = &loadedConfig
-
-	// Load serial port settings from config
+	configState.Store(loaded)
+	setAppliedStreamFactor(loaded.StreamQualityFactor)
+	streamUsesHEVC.Store(loaded.StreamEncodecType == "hevc")
 	loadSerialSettingsFromConfig()
-
-	logging.GetRootLogger().UpdateLogLevel(config.DefaultLogLevel)
-
+	logging.GetRootLogger().UpdateLogLevel(loaded.DefaultLogLevel)
 	logger.Info().Str("path", configPath).Msg("config loaded")
 }
 
@@ -557,62 +618,157 @@ func copyFile(src, dst string) error {
 	return nil
 }
 
-func SyncConfigSD(isUpdate bool) {
-	resp, err := rpcGetSDMountStatus()
+// SD backups carry portable settings. Authentication, network policy, and
+// connection or mount targets are managed exclusively in local configuration.
+var sdConfigKeys = []string{
+	"jiggler_enabled", "usb_enhanced_detection", "wake_on_lan_devices",
+	"keyboard_macros", "keyboard_layout", "keyboard_form_factor",
+	"hdmi_edid_string", "force_hpd", "active_extension", "display_rotation",
+	"display_brightness_percent", "display_dim_after_sec", "display_off_after_sec",
+	"io0_status", "io1_status", "audio_mode", "time_zone", "led_green_mode",
+	"led_yellow_mode", "serial_baud_rate", "serial_data_bits", "serial_stop_bits",
+	"serial_parity", "serial_port_enabled", "mobile_virtual_mouse",
+	"stream_quality_factor", "stream_encodec_type", "video_rc",
+}
+
+func writeSanitizedConfigToSD(srcPath, dstPath string) error {
+	raw, err := os.ReadFile(srcPath)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to get sd mount status")
-		return
+		return err
+	}
+	var local map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &local); err != nil {
+		return err
+	}
+	if local == nil {
+		return fmt.Errorf("local config must be a JSON object")
+	}
+	backup := make(map[string]json.RawMessage)
+	for _, key := range sdConfigKeys {
+		if value, ok := local[key]; ok {
+			backup[key] = value
+		}
+	}
+	raw, err = json.Marshal(backup)
+	if err != nil {
+		return err
+	}
+	return writeRawConfig(dstPath, raw)
+}
+
+func mergeSDConfigIntoUserdata(sdPath, userdataPath string) error {
+	sdRaw, err := os.ReadFile(sdPath)
+	if err != nil {
+		return err
+	}
+	var sd map[string]json.RawMessage
+	if err := json.Unmarshal(sdRaw, &sd); err != nil {
+		return err
+	}
+	if sd == nil {
+		return fmt.Errorf("SD config must be a JSON object")
+	}
+	local := make(map[string]json.RawMessage)
+	raw, err := os.ReadFile(userdataPath)
+	if err == nil {
+		if err := json.Unmarshal(raw, &local); err != nil {
+			return err
+		}
+		// Older builds could save null on first boot.
+		if local == nil {
+			local = make(map[string]json.RawMessage)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 
-	if resp.Status == SDMountOK {
-		if _, err := os.Stat(configPath); err != nil {
-			if err := SaveConfig(); err != nil {
-				logger.Error().Err(err).Msg("failed to create kvm_config.json")
-				return
-			}
+	for _, key := range sdConfigKeys {
+		if value, ok := sd[key]; ok {
+			local[key] = value
 		}
+	}
+	merged, err := json.Marshal(local)
+	if err != nil {
+		return err
+	}
+	var validated Config
+	if err := json.Unmarshal(merged, &validated); err != nil {
+		return err
+	}
+	return writeRawConfig(userdataPath, merged)
+}
 
-		if isUpdate {
-			if _, err := os.Stat(sdConfigPath); err == nil {
-				if err := copyFile(sdConfigPath, configPath); err != nil {
-					logger.Error().Err(err).Msg("failed to copy kvm_config.json from sdcard to userdata")
-					return
-				}
-			} else {
-				if err := copyFile(configPath, sdConfigPath); err != nil {
-					logger.Error().Err(err).Msg("failed to copy kvm_config.json from userdata to sdcard")
-					return
-				}
-			}
-		} else {
-			if err := copyFile(configPath, sdConfigPath); err != nil {
-				logger.Error().Err(err).Msg("failed to copy kvm_config.json from userdata to sdcard")
+func importConfigSD() {
+	resp, err := rpcGetSDMountStatus()
+	if err != nil {
+		logger.Warn().Err(err).Msg("failed to get SD mount status")
+		return
+	}
+	if resp.Status == SDMountOK {
+		if err := mergeSDConfigIntoUserdata(sdConfigPath, configPath); err != nil {
+			if _, statErr := os.Stat(sdConfigPath); os.IsNotExist(statErr) {
 				return
 			}
+			logger.Warn().Err(err).Msg("failed to import config from SD")
 		}
 	}
 }
 
-func SaveConfig() error {
-	configLock.Lock()
-	defer configLock.Unlock()
+var configSDExportMutex sync.Mutex
 
-	logger.Trace().Str("path", configPath).Msg("Saving config")
-
-	file, err := os.Create(configPath)
+func exportConfigSD() {
+	configSDExportMutex.Lock()
+	defer configSDExportMutex.Unlock()
+	resp, err := rpcGetSDMountStatus()
 	if err != nil {
-		return fmt.Errorf("failed to create config file: %w", err)
+		logger.Warn().Err(err).Msg("failed to get SD mount status")
+		return
 	}
-	defer file.Close()
+	if resp.Status == SDMountOK {
+		if err := writeSanitizedConfigToSD(configPath, sdConfigPath); err != nil {
+			logger.Warn().Err(err).Msg("failed to export config to SD")
+		}
+	}
+}
 
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(config); err != nil {
+func writeConfig(path string, next *Config) error {
+	if next == nil {
+		return errors.New("config has not been loaded")
+	}
+	raw, err := json.Marshal(next)
+	if err != nil {
 		return fmt.Errorf("failed to encode config: %w", err)
 	}
+	return writeRawConfig(path, raw)
+}
 
-	SyncConfigSD(false)
+// A published config and its nested values are read-only. Writers copy the
+// snapshot and replace any nested value they edit before publishing.
+func configSnapshot() *Config {
+	return configState.Load()
+}
 
+func updateConfig(edit func(*Config)) error {
+	if err := commitConfigAt(configPath, edit); err != nil {
+		return err
+	}
+	exportConfigSD()
+	return nil
+}
+
+func commitConfigAt(path string, edit func(*Config)) error {
+	configLock.Lock()
+	defer configLock.Unlock()
+	current := configSnapshot()
+	if current == nil {
+		return errors.New("config has not been loaded")
+	}
+	next := *current
+	edit(&next)
+	if err := writeConfig(path, &next); err != nil {
+		return err
+	}
+	configState.Store(&next)
 	return nil
 }
 
@@ -629,7 +785,7 @@ func generateAPIKey() (string, error) {
 }
 
 func ensureConfigLoaded() {
-	if config == nil {
+	if configSnapshot() == nil {
 		LoadConfig()
 	}
 }

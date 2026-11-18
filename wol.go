@@ -17,22 +17,77 @@ func rpcSendWOLMagicPacket(macAddress string) error {
 	// Create the magic packet
 	packet := createMagicPacket(mac)
 
-	// Set up UDP connection
-	conn, err := net.Dial("udp", "255.255.255.255:9")
-	if err != nil {
-		return ErrorfL(wolLogger, "failed to establish UDP connection", err)
-	}
-	defer conn.Close()
+	targets := collectWOLBroadcastTargets()
+	sentCount := 0
+	var lastErr error
 
-	// Send the packet
-	_, err = conn.Write(packet)
-	if err != nil {
-		return ErrorfL(wolLogger, "failed to send WOL packet", err)
+	for _, target := range targets {
+		conn, dialErr := net.Dial("udp4", target)
+		if dialErr != nil {
+			lastErr = dialErr
+			continue
+		}
+		_, writeErr := conn.Write(packet)
+		conn.Close()
+		if writeErr != nil {
+			lastErr = writeErr
+			continue
+		}
+		sentCount++
 	}
 
-	wolLogger.Info().Str("mac", macAddress).Msg("WOL packet sent")
+	if sentCount == 0 {
+		return ErrorfL(wolLogger, "failed to send WOL packet", lastErr)
+	}
+
+	wolLogger.Info().Str("mac", macAddress).Int("targets", sentCount).Msg("WOL packet sent")
 
 	return nil
+}
+
+// collectWOLBroadcastTargets returns 255.255.255.255:9 plus the directed IPv4
+// broadcast addresses of active non-loopback network interfaces (e.g., eth0),
+// so Wake-on-LAN works reliably even when VPN interfaces alter the default route.
+func collectWOLBroadcastTargets() []string {
+	seen := map[string]bool{"255.255.255.255:9": true}
+	targets := []string{"255.255.255.255:9"}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return targets
+	}
+
+	for _, iface := range ifaces {
+		if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagBroadcast) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP == nil {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			mask := ipNet.Mask
+			if ip4 == nil || len(mask) != net.IPv4len {
+				continue
+			}
+			bcast := make(net.IP, net.IPv4len)
+			for i := 0; i < net.IPv4len; i++ {
+				bcast[i] = ip4[i] | ^mask[i]
+			}
+			target := bcast.String() + ":9"
+			if !seen[target] {
+				seen[target] = true
+				targets = append(targets, target)
+			}
+		}
+	}
+
+	return targets
 }
 
 // createMagicPacket creates a Wake-on-LAN magic packet

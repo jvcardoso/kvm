@@ -21,14 +21,20 @@ var displaySocketConn net.Conn
 var (
 	displayOngoingRequests     = make(map[int32]chan *CtrlResponse)
 	displayOngoingRequestsLock = &sync.Mutex{}
-	displayConnWriteLock       = &sync.Mutex{}
+	displayConnWriteLock       = make(nativeControlLock, 1)
 )
 
-var displayLock = &sync.Mutex{}
+var displayActionGate = make(chan struct{}, 1)
+
+const displayCtrlTimeout = 3 * time.Second
 
 func CallDisplayCtrlAction(action string, params map[string]interface{}) (*CtrlResponse, error) {
-	displayLock.Lock()
-	defer displayLock.Unlock()
+	deadline := time.Now().Add(displayCtrlTimeout)
+	release, err := acquireNativeAction(displayActionGate, deadline)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	// The sequence number has to be reserved and registered atomically: the display
 	// socket handler looks the channel up from its own goroutine.
@@ -56,12 +62,14 @@ func CallDisplayCtrlAction(action string, params map[string]interface{}) (*CtrlR
 
 	scopedLogger.Debug().Msg("sending display ctrl action")
 
-	err = WriteDisplayCtrlMessage(jsonData)
+	err = writeDisplayCtrlMessageUntil(jsonData, deadline)
 	if err != nil {
 		dropDisplayResponseChan(ctrlSeq)
-		return nil, ErrorfL(&scopedLogger, "error writing display ctrl message", err)
+		return nil, fmt.Errorf("writing native control message: %w", err)
 	}
 
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case response := <-responseChan:
 		dropDisplayResponseChan(ctrlSeq)
@@ -73,11 +81,11 @@ func CallDisplayCtrlAction(action string, params map[string]interface{}) (*CtrlR
 			)
 		}
 		return response, nil
-	case <-time.After(3 * time.Second):
+	case <-timer.C:
 		// Never close the channel here: a late response must be dropped, not sent
 		// on a closed channel (that panics the whole app).
 		dropDisplayResponseChan(ctrlSeq)
-		return nil, ErrorfL(&scopedLogger, "timeout waiting for response", nil)
+		return nil, fmt.Errorf("waiting for native response: %w", os.ErrDeadlineExceeded)
 	}
 }
 
@@ -107,15 +115,16 @@ func deliverDisplayResponse(ctrlSeq int32, response *CtrlResponse) {
 }
 
 func WriteDisplayCtrlMessage(message []byte) error {
-	displayConnWriteLock.Lock()
-	defer displayConnWriteLock.Unlock()
+	return writeDisplayCtrlMessageUntil(message, time.Now().Add(displayCtrlTimeout))
+}
 
-	if displaySocketConn == nil {
-		return fmt.Errorf("display socket not connected")
+func writeDisplayCtrlMessageUntil(message []byte, deadline time.Time) error {
+	release, err := acquireNativeAction(displayConnWriteLock, deadline)
+	if err != nil {
+		return err
 	}
-
-	_, err := displaySocketConn.Write(message)
-	return err
+	defer release()
+	return writeNativeControl(displaySocketConn, message, deadline)
 }
 
 var displayCtrlSocketListener net.Listener
@@ -188,12 +197,13 @@ func handleDisplayCtrlClient(conn net.Conn) {
 		Logger()
 
 	scopedLogger.Info().Msg("display socket client connected")
+	displayConnWriteLock.Lock()
 	if displaySocketConn != nil {
 		scopedLogger.Debug().Msg("closing existing display socket connection")
 		displaySocketConn.Close()
 	}
-
 	displaySocketConn = conn
+	displayConnWriteLock.Unlock()
 
 	readBuf := make([]byte, 4096)
 	for {

@@ -14,6 +14,7 @@ import DetachIconRaw from "@/assets/detach-icon.svg";
 import { cx } from "@/cva.config";
 import { useHidStore, useSettingsStore, useUiStore } from "@/hooks/stores";
 import useKeyboard from "@/hooks/useKeyboard";
+import { useKeyboardTaps } from "@/hooks/useKeyboardTaps";
 import useKeyboardLayout from "@/hooks/useKeyboardLayout";
 import { keyDisplayMap2, keys, modifiers, sKeyDisplayMap, latchingKeys } from "@/keyboardMappings";
 import { dark_bg2_style} from "@/layout/theme_color";
@@ -34,8 +35,11 @@ function KeyboardWrapper() {
     state => state.isAttachedVirtualKeyboardVisible,
   );
 
-  const { sendKeyboardEvent, resetKeyboardState } = useKeyboard();
+  const { sendKeyboardEvent } = useKeyboard();
+  const virtualKeyboard = useHidStore(state => state.isVirtualKeyboardEnabled);
+  const tapKeyboard = useKeyboardTaps(sendKeyboardEvent, virtualKeyboard);
   const { selectedKeyboard } = useKeyboardLayout();
+  const isBrazilianKeyboard = selectedKeyboard.isoCode === "pt-BR";
   const keyboardFormFactor = useSettingsStore(state => state.keyboardFormFactor);
 
   // The mobile keyboard is a fixed four-row layout, so it never runs the full
@@ -244,8 +248,7 @@ function KeyboardWrapper() {
           setLockedModifiers(prev => ({ ...prev, ctrl: !prev.ctrl }));
         } else {
           // Direct trigger mode: send the side that was pressed
-          sendKeyboardEvent([], [modifiers[key]]);
-          setTimeout(resetKeyboardState, 100);
+          tapKeyboard([], [modifiers[key]]);
         }
         return;
       }
@@ -254,8 +257,7 @@ function KeyboardWrapper() {
           setLockedModifierKeys(prev => ({ ...prev, alt: key }));
           setLockedModifiers(prev => ({ ...prev, alt: !prev.alt }));
         } else {
-          sendKeyboardEvent([], [modifiers[key]]);
-          setTimeout(resetKeyboardState, 100);
+          tapKeyboard([], [modifiers[key]]);
         }
         return;
       }
@@ -264,8 +266,7 @@ function KeyboardWrapper() {
           setLockedModifierKeys(prev => ({ ...prev, meta: key }));
           setLockedModifiers(prev => ({ ...prev, meta: !prev.meta }));
         } else {
-          sendKeyboardEvent([], [modifiers[key]]);
-          setTimeout(resetKeyboardState, 100);
+          tapKeyboard([], [modifiers[key]]);
         }
         return;
       }
@@ -285,38 +286,34 @@ function KeyboardWrapper() {
           }
         } else {
           // Send the side that was actually pressed; {shift} falls back to left.
-          sendKeyboardEvent([], [modifiers[key] ?? modifiers["ShiftLeft"]]);
-          setTimeout(resetKeyboardState, 100);
+          tapKeyboard([], [modifiers[key] ?? modifiers["ShiftLeft"]]);
         }
         return;
       }
 
       if (key === "CtrlAltDelete") {
-        sendKeyboardEvent(
+        tapKeyboard(
           [keys["Delete"]],
           [modifiers["ControlLeft"], modifiers["AltLeft"]],
         );
-        setTimeout(resetKeyboardState, 100);
         return;
       }
 
       if (key === "AltMetaEscape") {
-        sendKeyboardEvent(
+        tapKeyboard(
           [keys["Escape"]],
           [modifiers["MetaLeft"], modifiers["AltLeft"]],
         );
 
-        setTimeout(resetKeyboardState, 100);
         return;
       }
 
       if (key === "CtrlAltBackspace") {
-        sendKeyboardEvent(
+        tapKeyboard(
           [keys["Backspace"]],
           [modifiers["ControlLeft"], modifiers["AltLeft"]],
         );
 
-        setTimeout(resetKeyboardState, 100);
         return;
       }
 
@@ -327,8 +324,7 @@ function KeyboardWrapper() {
           if (!isKeyboardLedManagedByHost) {
             setIsCapsLockActive(false);
           }
-          sendKeyboardEvent([keys["CapsLock"]], []);
-          setTimeout(resetKeyboardState, 100);
+          tapKeyboard([keys["CapsLock"]], []);
           return;
         }
       }
@@ -362,7 +358,7 @@ function KeyboardWrapper() {
       }
 
       // Update current keys and modifiers
-      sendKeyboardEvent(newKeys, newModifiers);
+      tapKeyboard(newKeys, newModifiers);
 
       // If shift was used as a modifier and caps lock is not active and shift is not locked, revert to default layout
       if (keyHasShiftModifier && !isCapsLockActive && !lockedModifiers.shift) {
@@ -379,12 +375,10 @@ function KeyboardWrapper() {
         });
         setLayoutName("default");
       }
-      setTimeout(resetKeyboardState, 100);
     },
-    [isCapsLockActive, isKeyboardLedManagedByHost, sendKeyboardEvent, resetKeyboardState, setIsCapsLockActive, lockedModifiers, lockedModifierKeys, modifierLockMode],
+    [isCapsLockActive, isKeyboardLedManagedByHost, tapKeyboard, setIsCapsLockActive, lockedModifiers, lockedModifierKeys, modifierLockMode],
   );
 
-  const virtualKeyboard = useHidStore(state => state.isVirtualKeyboardEnabled);
   const setVirtualKeyboard = useHidStore(state => state.setVirtualKeyboardEnabled);
 
   const modifierLockButtons = [
@@ -398,7 +392,8 @@ function KeyboardWrapper() {
     <div
       className="transition-all duration-200 ease-in-out"
       style={{
-        marginBottom: virtualKeyboard ? "0px" : `-${500}px`,
+        marginBottom: isMobile || virtualKeyboard ? "0px" : `-${500}px`,
+        ...(isMobile ? { maxHeight: "55dvh", overflowY: "auto" as const } : {}),
       }}
     >
       <AnimatePresence>
@@ -512,15 +507,15 @@ function KeyboardWrapper() {
                           }
                           onKeyDown(key);
                         }}
-                        display={sKeyDisplayMap}
+                        display={{ ...sKeyDisplayMap, ...(isBrazilianKeyboard ? { AltRight: "AltGr" } : {}) }}
                         layout={{
                           default: [
                             "Escape Tab MetaLeft PageUp ArrowUp PageDown Delete",
-                            "ShiftLeft ControlLeft AltLeft ArrowLeft ArrowDown ArrowRight Back",
+                            `ShiftLeft ControlLeft ${isBrazilianKeyboard ? "AltRight" : "AltLeft"} ArrowLeft ArrowDown ArrowRight Back`,
                           ],
                           shift: [
                             "Escape Tab MetaLeft PageUp ArrowUp PageDown Delete",
-                            "ShiftLeft ControlLeft AltLeft ArrowLeft ArrowDown ArrowRight Back",
+                            `ShiftLeft ControlLeft ${isBrazilianKeyboard ? "AltRight" : "AltLeft"} ArrowLeft ArrowDown ArrowRight Back`,
                           ],
                         }}
                         disableButtonHold={true}
@@ -538,7 +533,7 @@ function KeyboardWrapper() {
                                 baseClass="simple-keyboard-main2"
                                 layoutName={layoutName}
                                 onKeyPress={onKeyDown}
-                                display={keyDisplayMap2}
+                                display={keyDisplayMap}
                                 buttonTheme={
                                   modifierLockMode && modifierLockButtons
                                     ? [{ class: "modifier-locked", buttons: modifierLockButtons }]
@@ -573,7 +568,7 @@ function KeyboardWrapper() {
                                   }
                                   onKeyDown(key);
                                 }}
-                                display={keyDisplayMap2}
+                                display={keyDisplayMap}
                                 buttonTheme={
                                   modifierLockMode && modifierLockButtons
                                     ? [{ class: "modifier-locked", buttons: modifierLockButtons }]
@@ -602,7 +597,7 @@ function KeyboardWrapper() {
                                 baseClass="simple-keyboard-main2"
                                 layoutName={layoutName}
                                 onKeyPress={onKeyDown}
-                                display={keyDisplayMap2}
+                                display={keyDisplayMap}
                                 buttonTheme={
                                   modifierLockMode && modifierLockButtons
                                     ? [{ class: "modifier-locked", buttons: modifierLockButtons }]
@@ -632,7 +627,7 @@ function KeyboardWrapper() {
                                   onKeyPress={() => {
                                     setUseNum(false);
                                   }}
-                                  display={keyDisplayMap2}
+                                  display={keyDisplayMap}
                                   layout={{
                                     default: [
                                       "abc",
@@ -647,7 +642,7 @@ function KeyboardWrapper() {
                                   baseClass="simple-keyboard-main2"
                                   layoutName={layoutName}
                                   onKeyPress={onKeyDown}
-                                  display={keyDisplayMap2}
+                                  display={keyDisplayMap}
                                   layout={{
                                     default: [
                                       "Space",
@@ -667,7 +662,7 @@ function KeyboardWrapper() {
                                   baseClass="simple-keyboard-main2"
                                   layoutName={layoutName}
                                   onKeyPress={onKeyDown}
-                                  display={keyDisplayMap2}
+                                  display={keyDisplayMap}
                                   layout={{
                                     default: [
                                       "Enter",
@@ -687,7 +682,7 @@ function KeyboardWrapper() {
                                 baseClass="simple-keyboard-main2"
                                 layoutName={layoutName}
                                 onKeyPress={onKeyDown}
-                                display={keyDisplayMap2}
+                                display={keyDisplayMap}
                                 layout={{
                                   default: [
                                     "KeyQ KeyW KeyE KeyR KeyT KeyY KeyU KeyI KeyO KeyP",
@@ -707,16 +702,16 @@ function KeyboardWrapper() {
                                 baseClass="simple-keyboard-main2"
                                 layoutName={layoutName}
                                 onKeyPress={onKeyDown}
-                                display={keyDisplayMap2}
+                                display={keyDisplayMap}
                                 layout={{
                                   default: [
 
-                                    "KeyA KeyS KeyD KeyF KeyG KeyH KeyJ KeyK KeyL",
+                                    `KeyA KeyS KeyD KeyF KeyG KeyH KeyJ KeyK KeyL${isBrazilianKeyboard ? " Semicolon" : ""}`,
 
                                   ],
                                   shift: [
 
-                                    "(KeyA) (KeyS) (KeyD) (KeyF) (KeyG) (KeyH) (KeyJ) (KeyK) (KeyL)",
+                                    `(KeyA) (KeyS) (KeyD) (KeyF) (KeyG) (KeyH) (KeyJ) (KeyK) (KeyL)${isBrazilianKeyboard ? " (Semicolon)" : ""}`,
 
                                   ],
                                 }}
@@ -731,15 +726,15 @@ function KeyboardWrapper() {
                                 baseClass="simple-keyboard-main2"
                                 layoutName={layoutName}
                                 onKeyPress={onKeyDown}
-                                display={keyDisplayMap2}
+                                display={keyDisplayMap}
                                 layout={{
                                   default: [
 
-                                    `ShiftLeft${formFactorIsISO ? " IntlBackslash" : ""} KeyZ KeyX KeyC KeyV KeyB KeyN KeyM Backspace${formFactorIsJIS ? " KeyRO" : ""}`,
+                                    `ShiftLeft${formFactorIsISO || isBrazilianKeyboard ? " IntlBackslash" : ""} KeyZ KeyX KeyC KeyV KeyB KeyN KeyM Backspace${formFactorIsJIS ? " KeyRO" : ""}`,
                                   ],
                                   shift: [
 
-                                    `ShiftLeft${formFactorIsISO ? " (IntlBackslash)" : ""} (KeyZ) (KeyX) (KeyC) (KeyV) (KeyB) (KeyN) (KeyM) Backspace${formFactorIsJIS ? " (KeyRO)" : ""}`,
+                                    `ShiftLeft${formFactorIsISO || isBrazilianKeyboard ? " (IntlBackslash)" : ""} (KeyZ) (KeyX) (KeyC) (KeyV) (KeyB) (KeyN) (KeyM) Backspace${formFactorIsJIS ? " (KeyRO)" : ""}`,
                                   ],
                                 }}
 
@@ -756,7 +751,7 @@ function KeyboardWrapper() {
                                   onKeyPress={() => {
                                     setUseNum(true);
                                   }}
-                                  display={keyDisplayMap2}
+                                  display={keyDisplayMap}
                                   layout={{
                                     default: [
                                       "123",
@@ -792,7 +787,7 @@ function KeyboardWrapper() {
                                   baseClass="simple-keyboard-main2"
                                   layoutName={layoutName}
                                   onKeyPress={onKeyDown}
-                                  display={keyDisplayMap2}
+                                  display={keyDisplayMap}
                                   layout={{
                                     default: [
                                       "Space",
@@ -812,7 +807,7 @@ function KeyboardWrapper() {
                                   baseClass="simple-keyboard-main2"
                                   layoutName={layoutName}
                                   onKeyPress={onKeyDown}
-                                  display={keyDisplayMap2}
+                                  display={keyDisplayMap}
                                   layout={{
                                     default: [
                                       "Enter",

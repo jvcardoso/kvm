@@ -7,8 +7,7 @@ import { SettingsPageHeader } from "@components/Settings/SettingsPageheader";
 import { useSettingsStore } from "@/hooks/stores";
 import type { FullscreenMode } from "@/hooks/stores";
 import { SettingsItem } from "@components/Settings/SettingsView";
-import enJSON from '@/locales/en.json';
-import zhJSON from '@/locales/zh.json';
+import { getLocaleMessages } from '@/locales';
 import { ThemeMode, useTheme } from "@/layout/contexts/ThemeContext";
 import { dark_font_style } from "@/layout/theme_color";
 
@@ -33,12 +32,12 @@ export default function SettingsGeneral() {
   // Language Change Handler
   const handleLanguageChange = (value: string) => {
     setLanguage(value);
-    setCurrentLang(value, value === 'en' ? enJSON : zhJSON);
+    setCurrentLang(value, getLocaleMessages(value));
   };
 
   // Initialize Language
   useEffect(() => {
-    setCurrentLang(language, language === 'en' ? enJSON : zhJSON);
+    setCurrentLang(language, getLocaleMessages(language));
   }, [language, setCurrentLang]);
 
   // Theme Change Handler
@@ -104,6 +103,7 @@ export default function SettingsGeneral() {
               className={`!w-full !h-[36px]`}
             >
               <Option value="en" className={dark_font_style}>{$at('English')}</Option>
+              <Option value="pt" className={dark_font_style}>Português (Brasil)</Option>
               <Option value="zh" className={dark_font_style}>{$at('中文')}</Option>
             </Select>
           </div>

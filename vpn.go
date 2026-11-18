@@ -136,17 +136,19 @@ func rpcLoginTailScale(xEdge bool) (TailScaleSettings, error) {
 
 		switch settings.State {
 		case "logined":
-			config.TailScaleAutoStart = true
-			config.TailScaleXEdge = settings.XEdge
-			err := SaveConfig()
+			err := updateConfig(func(next *Config) {
+				next.TailScaleAutoStart = true
+				next.TailScaleXEdge = settings.XEdge
+			})
 			if err != nil {
 				vpnLogger.Error().Err(err).Msg("failed to save config")
 			}
 			return settings, err
 		case "connected":
-			config.TailScaleAutoStart = true
-			config.TailScaleXEdge = settings.XEdge
-			err = SaveConfig()
+			err = updateConfig(func(next *Config) {
+				next.TailScaleAutoStart = true
+				next.TailScaleXEdge = settings.XEdge
+			})
 			if err != nil {
 				vpnLogger.Error().Err(err).Msg("failed to save config")
 			}
@@ -177,9 +179,9 @@ func rpcLogoutTailScale() error {
 	if err != nil {
 		return err
 	}
-	config.TailScaleAutoStart = false
-
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.TailScaleAutoStart = false
+	}); err != nil {
 		return err
 	}
 
@@ -227,7 +229,7 @@ func rpcLoginZeroTier(networkID string) (ZeroTierSettings, error) {
 
 	resp, err := CallVpnCtrlAction("login_zerotier", map[string]interface{}{
 		"network_id":        networkID,
-		"config_network_id": config.ZeroTierNetworkID,
+		"config_network_id": configSnapshot().ZeroTierNetworkID,
 	})
 	if err != nil {
 		return ZeroTierSettings{}, err
@@ -246,15 +248,17 @@ func rpcLoginZeroTier(networkID string) (ZeroTierSettings, error) {
 
 	switch settings.State {
 	case "closed":
-		config.ZeroTierAutoStart = false
-		config.ZeroTierNetworkID = ""
-		if err := SaveConfig(); err != nil {
+		if err := updateConfig(func(next *Config) {
+			next.ZeroTierAutoStart = false
+			next.ZeroTierNetworkID = ""
+		}); err != nil {
 			vpnLogger.Error().Err(err).Msg("failed to save config")
 		}
 	case "connected", "logined":
-		config.ZeroTierAutoStart = true
-		config.ZeroTierNetworkID = settings.NetworkID
-		if err := SaveConfig(); err != nil {
+		if err := updateConfig(func(next *Config) {
+			next.ZeroTierAutoStart = true
+			next.ZeroTierNetworkID = settings.NetworkID
+		}); err != nil {
 			vpnLogger.Error().Err(err).Msg("failed to save config")
 		}
 	}
@@ -271,9 +275,10 @@ func rpcLogoutZeroTier(networkID string) error {
 		return err
 	}
 
-	config.ZeroTierAutoStart = false
-	config.ZeroTierNetworkID = ""
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.ZeroTierAutoStart = false
+		next.ZeroTierNetworkID = ""
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -281,7 +286,7 @@ func rpcLogoutZeroTier(networkID string) error {
 
 func rpcGetZeroTierSettings() (ZeroTierSettings, error) {
 	LoadConfig()
-	configNetworkID := fmt.Sprintf("%v", config.ZeroTierNetworkID)
+	configNetworkID := fmt.Sprintf("%v", configSnapshot().ZeroTierNetworkID)
 	settings := ZeroTierSettings{
 		State:     "disconnected",
 		NetworkID: configNetworkID,
@@ -397,7 +402,7 @@ func rpcGetFrpcLog() (string, error) {
 }
 
 func rpcGetFrpcToml() (string, error) {
-	return config.FrpcToml, nil
+	return configSnapshot().FrpcToml, nil
 }
 
 func rpcStartFrpc(frpcToml string) error {
@@ -426,9 +431,11 @@ func rpcStartFrpc(frpcToml string) error {
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start frpc failed: %w", err)
 		} else {
-			config.FrpcAutoStart = true
-			config.FrpcToml = frpcToml
-			if err := SaveConfig(); err != nil {
+			go func() { _ = cmd.Wait() }()
+			if err := updateConfig(func(next *Config) {
+				next.FrpcAutoStart = true
+				next.FrpcToml = frpcToml
+			}); err != nil {
 				return fmt.Errorf("failed to save config: %w", err)
 			}
 		}
@@ -447,8 +454,9 @@ func rpcStopFrpc() error {
 		}
 	}
 
-	config.FrpcAutoStart = false
-	err := SaveConfig()
+	err := updateConfig(func(next *Config) {
+		next.FrpcAutoStart = false
+	})
 	if err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
@@ -493,9 +501,11 @@ func rpcStartCloudflared(token string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start cloudflared failed: %w", err)
 	}
-	config.CloudflaredAutoStart = true
-	config.CloudflaredToken = token
-	if err := SaveConfig(); err != nil {
+	go func() { _ = cmd.Wait() }()
+	if err := updateConfig(func(next *Config) {
+		next.CloudflaredAutoStart = true
+		next.CloudflaredToken = token
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -508,8 +518,9 @@ func rpcStopCloudflared() error {
 			return fmt.Errorf("failed to stop cloudflared: %w", err)
 		}
 	}
-	config.CloudflaredAutoStart = false
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.CloudflaredAutoStart = false
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -611,7 +622,7 @@ func rpcGetEasyTierNodeInfo() (string, error) {
 }
 
 func rpcGetEasyTierConfig() (EasytierConfig, error) {
-	return config.EasytierConfig, nil
+	return configSnapshot().EasytierConfig, nil
 }
 
 func rpcStartEasyTier(name, secret, node string) error {
@@ -639,13 +650,15 @@ func rpcStartEasyTier(name, secret, node string) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start easytier failed: %w", err)
 	} else {
-		config.EasytierAutoStart = true
-		config.EasytierConfig = EasytierConfig{
-			Name:   name,
-			Secret: secret,
-			Node:   node,
-		}
-		if err := SaveConfig(); err != nil {
+		go func() { _ = cmd.Wait() }()
+		if err := updateConfig(func(next *Config) {
+			next.EasytierAutoStart = true
+			next.EasytierConfig = EasytierConfig{
+				Name:   name,
+				Secret: secret,
+				Node:   node,
+			}
+		}); err != nil {
 			return fmt.Errorf("failed to save config: %w", err)
 		}
 	}
@@ -661,8 +674,9 @@ func rpcStopEasyTier() error {
 		}
 	}
 
-	config.EasytierAutoStart = false
-	err := SaveConfig()
+	err := updateConfig(func(next *Config) {
+		next.EasytierAutoStart = false
+	})
 	if err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
@@ -729,11 +743,11 @@ func rpcGetVntInfo() (string, error) {
 }
 
 func rpcGetVntConfig() (VntConfig, error) {
-	return config.VntConfig, nil
+	return configSnapshot().VntConfig, nil
 }
 
 func rpcGetVntConfigFile() (string, error) {
-	return config.VntConfig.ConfigFile, nil
+	return configSnapshot().VntConfig.ConfigFile, nil
 }
 
 func rpcStartVnt(configMode, token, deviceId, name, serverAddr, configFile string, model string, password string) error {
@@ -803,18 +817,20 @@ func rpcStartVnt(configMode, token, deviceId, name, serverAddr, configFile strin
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start vnt failed: %w", err)
 	} else {
-		config.VntAutoStart = true
-		config.VntConfig = VntConfig{
-			ConfigMode: configMode,
-			Token:      token,
-			DeviceId:   deviceId,
-			Name:       name,
-			ServerAddr: serverAddr,
-			ConfigFile: configFile,
-			Model:      model,
-			Password:   password,
-		}
-		if err := SaveConfig(); err != nil {
+		go func() { _ = cmd.Wait() }()
+		if err := updateConfig(func(next *Config) {
+			next.VntAutoStart = true
+			next.VntConfig = VntConfig{
+				ConfigMode: configMode,
+				Token:      token,
+				DeviceId:   deviceId,
+				Name:       name,
+				ServerAddr: serverAddr,
+				ConfigFile: configFile,
+				Model:      model,
+				Password:   password,
+			}
+		}); err != nil {
 			return fmt.Errorf("failed to save config: %w", err)
 		}
 	}
@@ -830,8 +846,9 @@ func rpcStopVnt() error {
 		}
 	}
 
-	config.VntAutoStart = false
-	err := SaveConfig()
+	err := updateConfig(func(next *Config) {
+		next.VntAutoStart = false
+	})
 	if err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
@@ -888,7 +905,7 @@ func rpcGetWireguardLog() (string, error) {
 }
 
 func rpcGetWireguardConfig() (WireguardConfig, error) {
-	return config.WireguardConfig, nil
+	return configSnapshot().WireguardConfig, nil
 }
 
 func rpcStartWireguard(configFile string) error {
@@ -918,9 +935,10 @@ func rpcStartWireguard(configFile string) error {
 		return fmt.Errorf("start wireguard failed: %w", err)
 	}
 
-	config.WireguardAutoStart = true
-	config.WireguardConfig.ConfigFile = configFile
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.WireguardAutoStart = true
+		next.WireguardConfig.ConfigFile = configFile
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -942,8 +960,9 @@ func rpcStopWireguard() error {
 		}
 	}
 
-	config.WireguardAutoStart = false
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.WireguardAutoStart = false
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -975,72 +994,62 @@ func initVPN() {
 			}
 		}
 
-		if config.TailScaleAutoStart {
+		cfg := configSnapshot()
+		if cfg.TailScaleAutoStart {
 			startVpnAutoStartTask("tailscale", func() error {
-				_, err := rpcLoginTailScale(config.TailScaleXEdge)
+				_, err := rpcLoginTailScale(cfg.TailScaleXEdge)
 				return err
 			})
 		}
 
-		if config.ZeroTierAutoStart && config.ZeroTierNetworkID != "" {
-			if _, err := rpcLoginZeroTier(config.ZeroTierNetworkID); err != nil {
+		if cfg.ZeroTierAutoStart && cfg.ZeroTierNetworkID != "" {
+			if _, err := rpcLoginZeroTier(cfg.ZeroTierNetworkID); err != nil {
 				vpnLogger.Error().Err(err).Msg("Failed to auto start ZeroTier")
 			}
 		}
 
-		if config.FrpcAutoStart && config.FrpcToml != "" {
-			if err := rpcStartFrpc(config.FrpcToml); err != nil {
+		if cfg.FrpcAutoStart && cfg.FrpcToml != "" {
+			if err := rpcStartFrpc(cfg.FrpcToml); err != nil {
 				vpnLogger.Error().Err(err).Msg("Failed to auto start frpc")
 			}
 		}
 
-		if config.EasytierAutoStart && config.EasytierConfig.Name != "" && config.EasytierConfig.Secret != "" && config.EasytierConfig.Node != "" {
-			if err := rpcStartEasyTier(config.EasytierConfig.Name, config.EasytierConfig.Secret, config.EasytierConfig.Node); err != nil {
+		if cfg.EasytierAutoStart && cfg.EasytierConfig.Name != "" && cfg.EasytierConfig.Secret != "" && cfg.EasytierConfig.Node != "" {
+			if err := rpcStartEasyTier(cfg.EasytierConfig.Name, cfg.EasytierConfig.Secret, cfg.EasytierConfig.Node); err != nil {
 				vpnLogger.Error().Err(err).Msg("Failed to auto start easytier")
 			}
 		}
 
-		if config.VntAutoStart {
-			if config.VntConfig.ConfigMode == "file" && config.VntConfig.ConfigFile != "" {
-				if err := rpcStartVnt("file", "", "", "", "", config.VntConfig.ConfigFile, config.VntConfig.Model, config.VntConfig.Password); err != nil {
+		if cfg.VntAutoStart {
+			if cfg.VntConfig.ConfigMode == "file" && cfg.VntConfig.ConfigFile != "" {
+				if err := rpcStartVnt("file", "", "", "", "", cfg.VntConfig.ConfigFile, cfg.VntConfig.Model, cfg.VntConfig.Password); err != nil {
 					vpnLogger.Error().Err(err).Msg("Failed to auto start vnt (file mode)")
 				}
-			} else if config.VntConfig.Token != "" {
-				if err := rpcStartVnt("params", config.VntConfig.Token, config.VntConfig.DeviceId, config.VntConfig.Name, config.VntConfig.ServerAddr, "", config.VntConfig.Model, config.VntConfig.Password); err != nil {
+			} else if cfg.VntConfig.Token != "" {
+				if err := rpcStartVnt("params", cfg.VntConfig.Token, cfg.VntConfig.DeviceId, cfg.VntConfig.Name, cfg.VntConfig.ServerAddr, "", cfg.VntConfig.Model, cfg.VntConfig.Password); err != nil {
 					vpnLogger.Error().Err(err).Msg("Failed to auto start vnt (params mode)")
 				}
 			}
 		}
 
-		if config.CloudflaredAutoStart && config.CloudflaredToken != "" {
-			if err := rpcStartCloudflared(config.CloudflaredToken); err != nil {
+		if cfg.CloudflaredAutoStart && cfg.CloudflaredToken != "" {
+			if err := rpcStartCloudflared(cfg.CloudflaredToken); err != nil {
 				vpnLogger.Error().Err(err).Msg("Failed to auto start cloudflared")
 			}
 		}
 
-		if config.WireguardAutoStart && config.WireguardConfig.ConfigFile != "" {
-			if err := rpcStartWireguard(config.WireguardConfig.ConfigFile); err != nil {
+		if cfg.WireguardAutoStart && cfg.WireguardConfig.ConfigFile != "" {
+			if err := rpcStartWireguard(cfg.WireguardConfig.ConfigFile); err != nil {
 				vpnLogger.Error().Err(err).Msg("Failed to auto start wireguard")
 			}
 		}
 
-		if config.NetbirdAutoStart && config.NetbirdManagementURL != "" {
+		if cfg.NetbirdAutoStart && cfg.NetbirdManagementURL != "" {
 			if err := rpcStartNetbird(); err != nil {
 				vpnLogger.Error().Err(err).Msg("Failed to auto start netbird")
 			}
-			if _, err := rpcNetbirdUp(config.NetbirdManagementURL); err != nil {
+			if _, err := rpcNetbirdUp(cfg.NetbirdManagementURL); err != nil {
 				vpnLogger.Error().Err(err).Msg("Failed to auto connect netbird")
-			}
-		}
-	}()
-
-	go func() {
-		for {
-			var status syscall.WaitStatus
-			var rusage syscall.Rusage
-			pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, &rusage)
-			if pid <= 0 || err != nil {
-				time.Sleep(5 * time.Second)
 			}
 		}
 	}()
@@ -1267,8 +1276,9 @@ func rpcStartNetbird() error {
 		return fmt.Errorf("failed to start netbird service: %w, output: %s", err, string(output))
 	}
 	vpnLogger.Info().Msg("Netbird service started")
-	config.NetbirdAutoStart = true
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.NetbirdAutoStart = true
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -1286,8 +1296,9 @@ func rpcStopNetbird() error {
 		return fmt.Errorf("failed to stop netbird service: %w, output: %s", err, string(output))
 	}
 	vpnLogger.Info().Msg("Netbird service stopped")
-	config.NetbirdAutoStart = false
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.NetbirdAutoStart = false
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 	return nil
@@ -1299,7 +1310,7 @@ func rpcGetNetbirdStatus() (NetbirdStatus, error) {
 
 	status := NetbirdStatus{
 		Running:       netbirdRunning(),
-		ManagementURL: sanitizeNetbirdManagementURL(config.NetbirdManagementURL),
+		ManagementURL: sanitizeNetbirdManagementURL(configSnapshot().NetbirdManagementURL),
 	}
 
 	if !status.Running {
@@ -1419,8 +1430,9 @@ func rpcNetbirdUp(managementURL string) (NetbirdStatus, error) {
 	}()
 
 	vpnLogger.Info().Str("management_url", managementURL).Msg("Netbird up started in background")
-	config.NetbirdManagementURL = managementURL
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.NetbirdManagementURL = managementURL
+	}); err != nil {
 		return status, fmt.Errorf("failed to save config: %w", err)
 	}
 
@@ -1429,7 +1441,7 @@ func rpcNetbirdUp(managementURL string) (NetbirdStatus, error) {
 func rpcGetNetbirdUpLog() (NetbirdStatus, error) {
 	status := NetbirdStatus{
 		Running:       netbirdRunning(),
-		ManagementURL: sanitizeNetbirdManagementURL(config.NetbirdManagementURL),
+		ManagementURL: sanitizeNetbirdManagementURL(configSnapshot().NetbirdManagementURL),
 	}
 
 	ssoLoginURL, err := getNetbirdSSOLoginURL()
@@ -1458,9 +1470,10 @@ func rpcGetNetbirdUpLog() (NetbirdStatus, error) {
 		}
 
 		// Enable autostart when connected
-		if netbirdStatus.Connected && !config.NetbirdAutoStart {
-			config.NetbirdAutoStart = true
-			if err := SaveConfig(); err != nil {
+		if netbirdStatus.Connected && !configSnapshot().NetbirdAutoStart {
+			if err := updateConfig(func(next *Config) {
+				next.NetbirdAutoStart = true
+			}); err != nil {
 				vpnLogger.Error().Err(err).Msg("Failed to save config after netbird connected")
 			}
 		}

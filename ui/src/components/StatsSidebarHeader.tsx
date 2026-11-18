@@ -1,4 +1,6 @@
 import { isMobile } from "react-device-detect";
+import { LuX } from "react-icons/lu";
+import { useReactAt } from "i18n-auto-extractor/react";
 
 import { Button } from "@components/Button";
 import { cx } from "@/cva.config";
@@ -10,6 +12,7 @@ export default function StatsSidebarHeader({
   title: string;
   setSidebarView: (view: AvailableSidebarViews | null) => void;
 }) {
+  const { $at } = useReactAt();
   if(isMobile){
     return (
       <div
@@ -17,7 +20,14 @@ export default function StatsSidebarHeader({
         <div className="min-w-0" style={{ flex: 1 }}>
           <h2 className="text-[18px] text-black truncate dark:text-white">{title}</h2>
         </div>
-        <div></div>
+        <button
+          type="button"
+          aria-label={$at("Close")}
+          onClick={() => setSidebarView(null)}
+          className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-black active:bg-black/10 dark:text-white dark:active:bg-white/10"
+        >
+          <LuX size={22} />
+        </button>
       </div>
 
     )

@@ -25,9 +25,9 @@ export const VideoElement = forwardRef<HTMLVideoElement, VideoElementProps>(
 
     const mergedStyle = {
       ...style,
-      maxWidth: '100vw',
-      width: '100vw',
-      height: 'auto',
+      ...(isMobile
+        ? { maxWidth: "100%", maxHeight: "100%", width: "auto", height: "auto" }
+        : { maxWidth: "100vw", width: "100vw", height: "auto" }),
     };
 
     return (

@@ -134,11 +134,11 @@ func onHidDeviceMissing(device string, err error) {
 		Err(err).
 		Msg("HID device missing, sending notification to client")
 
-	if currentSession != nil {
+	if session := currentSession.Load(); session != nil {
 		writeJSONRPCEvent("hidDeviceMissing", map[string]interface{}{
 			"device": device,
 			"error":  err.Error(),
-		}, currentSession)
+		}, session)
 	}
 
 	switch decideAutoReinit() {
@@ -165,7 +165,7 @@ func initUsbGadget() {
 	// report_desc is only read when the keyboard function is bound, so the
 	// descriptor the persisted arrangement needs has to be selected before the
 	// gadget is created.
-	usbgadget.ApplyKeyboardReportDescForFormFactor(config.KeyboardFormFactor)
+	usbgadget.ApplyKeyboardReportDescForFormFactor(configSnapshot().KeyboardFormFactor)
 
 	resp, _ := rpcGetSDMountStatus()
 	if resp.Status == SDMountOK {
@@ -180,22 +180,22 @@ func initUsbGadget() {
 
 	gadget = usbgadget.NewUsbGadget(
 		"kvm",
-		config.UsbDevices,
-		config.UsbConfig,
+		configSnapshot().UsbDevices,
+		configSnapshot().UsbConfig,
 		usbLogger,
 	)
 
 	gadget.SetOnKeyboardStateChange(func(state usbgadget.KeyboardState) {
-		if currentSession != nil {
-			writeJSONRPCEvent("keyboardLedState", state, currentSession)
+		if session := currentSession.Load(); session != nil {
+			writeJSONRPCEvent("keyboardLedState", state, session)
 		}
 	})
 
 	// Device-truth keyboard state: the client highlights keys from this, not from
 	// what it believes it sent, so left/right modifiers stay distinct.
 	gadget.SetOnKeysDownChange(func(state usbgadget.KeysDownState) {
-		if currentSession != nil {
-			currentSession.enqueueKeysDownState(state)
+		if session := currentSession.Load(); session != nil {
+			session.enqueueKeysDownState(state)
 		}
 	})
 
@@ -239,7 +239,7 @@ func initSystemInfo() {
 }
 
 func initAutoMountImage() {
-	if config.AutoMountImage == nil || config.AutoMountImage.Filename == "" {
+	if autoMount := configSnapshot().AutoMountImage; autoMount == nil || autoMount.Filename == "" {
 		return
 	}
 
@@ -256,7 +256,7 @@ func initAutoMountImage() {
 
 		// Snapshot the config: it can be cleared from the UI while we wait below,
 		// and dereferencing config.AutoMountImage after that would panic.
-		autoMount := config.AutoMountImage
+		autoMount := configSnapshot().AutoMountImage
 		if autoMount == nil || autoMount.Filename == "" {
 			usbLogger.Info().Msg("auto-mount config cleared meanwhile, skipping")
 			return
@@ -326,8 +326,11 @@ func initAutoMountImage() {
 			// Clear auto-mount config if file not found
 			if strings.Contains(err.Error(), "file does not exist") || strings.Contains(err.Error(), "no such file") {
 				usbLogger.Warn().Msg("auto-mount image not found, clearing auto-mount config")
-				config.AutoMountImage = nil
-				SaveConfig()
+				updateConfig(func(next *Config) {
+					if next.AutoMountImage == autoMount {
+						next.AutoMountImage = nil
+					}
+				})
 			}
 		} else {
 			usbLogger.Info().Msgf("auto-mounted %s as %s from %s", autoMount.Filename, mode, autoMount.Source)
@@ -556,17 +559,18 @@ func usbReadyForHidReports() bool {
 }
 
 func rpcGetUSBState() (state string) {
-	return gadget.GetUsbState(config.UsbEnhancedDetection)
+	return gadget.GetUsbState(configSnapshot().UsbEnhancedDetection)
 }
 
 func triggerUSBStateUpdate() {
 	state := getUSBStateCached()
 	go func() {
-		if currentSession == nil {
+		session := currentSession.Load()
+		if session == nil {
 			usbLogger.Info().Msg("No active RPC session, skipping update state update")
 			return
 		}
-		writeJSONRPCEvent("usbState", state, currentSession)
+		writeJSONRPCEvent("usbState", state, session)
 	}()
 }
 
@@ -579,7 +583,7 @@ const ledRestoreBackoff = 30 * time.Second
 var ledRestoreLastAttempt time.Time
 
 func checkUSBState() {
-	newState := gadget.GetUsbState(config.UsbEnhancedDetection)
+	newState := gadget.GetUsbState(configSnapshot().UsbEnhancedDetection)
 
 	// Configuration updates recreate hidg nodes after the initial LED reader
 	// starts. Restore it without waiting for the next keyboard input.
@@ -700,22 +704,22 @@ func rpcReinitializeUsbGadget() error {
 	// Recreate the gadget instance similar to program restart
 	gadget = usbgadget.NewUsbGadget(
 		"kvm",
-		config.UsbDevices,
-		config.UsbConfig,
+		configSnapshot().UsbDevices,
+		configSnapshot().UsbConfig,
 		usbLogger,
 	)
 
 	// Reapply callbacks
 	gadget.SetOnKeyboardStateChange(func(state usbgadget.KeyboardState) {
-		if currentSession != nil {
-			writeJSONRPCEvent("keyboardLedState", state, currentSession)
+		if session := currentSession.Load(); session != nil {
+			writeJSONRPCEvent("keyboardLedState", state, session)
 		}
 	})
 	// The keys-down callback lives on the gadget instance, so a recreated gadget
 	// must carry it over or the client stops receiving device-truth key state.
 	gadget.SetOnKeysDownChange(func(state usbgadget.KeysDownState) {
-		if currentSession != nil {
-			currentSession.enqueueKeysDownState(state)
+		if session := currentSession.Load(); session != nil {
+			session.enqueueKeysDownState(state)
 		}
 	})
 	gadget.SetOnHidDeviceMissing(onHidDeviceMissing)

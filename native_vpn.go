@@ -18,11 +18,17 @@ var (
 
 var vpnSocketConn net.Conn
 
-var vpnOngoingRequests = make(map[int32]chan *CtrlResponse)
+var (
+	vpnOngoingRequests = make(map[int32]chan *CtrlResponse)
+	vpnConnWriteLock   = make(nativeControlLock, 1)
+)
 
 var vpnLock = &sync.Mutex{}
 
+const vpnCtrlTimeout = 30 * time.Second
+
 func CallVpnCtrlAction(action string, params map[string]interface{}) (*CtrlResponse, error) {
+	deadline := time.Now().Add(vpnCtrlTimeout)
 	vpnLock.Lock()
 	ctrlAction := CtrlAction{
 		Action: action,
@@ -36,7 +42,9 @@ func CallVpnCtrlAction(action string, params map[string]interface{}) (*CtrlRespo
 
 	jsonData, err := json.Marshal(ctrlAction)
 	if err != nil {
+		vpnLock.Lock()
 		delete(vpnOngoingRequests, ctrlAction.Seq)
+		vpnLock.Unlock()
 		return nil, fmt.Errorf("error marshaling ctrl action: %w", err)
 	}
 
@@ -46,12 +54,16 @@ func CallVpnCtrlAction(action string, params map[string]interface{}) (*CtrlRespo
 
 	scopedLogger.Debug().Msg("sending vpn ctrl action")
 
-	err = WriteVpnCtrlMessage(jsonData)
+	err = writeVpnCtrlMessageUntil(jsonData, deadline)
 	if err != nil {
+		vpnLock.Lock()
 		delete(vpnOngoingRequests, ctrlAction.Seq)
-		return nil, ErrorfL(&scopedLogger, "error writing vpn ctrl message", err)
+		vpnLock.Unlock()
+		return nil, fmt.Errorf("writing native control message: %w", err)
 	}
 
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case response := <-responseChan:
 		vpnLock.Lock()
@@ -65,20 +77,25 @@ func CallVpnCtrlAction(action string, params map[string]interface{}) (*CtrlRespo
 			)
 		}
 		return response, nil
-	case <-time.After(30 * time.Second):
+	case <-timer.C:
 		vpnLock.Lock()
 		delete(vpnOngoingRequests, ctrlAction.Seq)
 		vpnLock.Unlock()
-		return nil, ErrorfL(&scopedLogger, "timeout waiting for response", nil)
+		return nil, fmt.Errorf("waiting for native response: %w", os.ErrDeadlineExceeded)
 	}
 }
 
 func WriteVpnCtrlMessage(message []byte) error {
-	if vpnSocketConn == nil {
-		return fmt.Errorf("vpn socket not conn ected")
+	return writeVpnCtrlMessageUntil(message, time.Now().Add(vpnCtrlTimeout))
+}
+
+func writeVpnCtrlMessageUntil(message []byte, deadline time.Time) error {
+	release, err := acquireNativeAction(vpnConnWriteLock, deadline)
+	if err != nil {
+		return err
 	}
-	_, err := vpnSocketConn.Write(message)
-	return err
+	defer release()
+	return writeNativeControl(vpnSocketConn, message, deadline)
 }
 
 var vpnCtrlSocketListener net.Listener
@@ -151,12 +168,13 @@ func handleVpnCtrlClient(conn net.Conn) {
 		Logger()
 
 	scopedLogger.Info().Msg("vpn socket client connected")
+	vpnConnWriteLock.Lock()
 	if vpnSocketConn != nil {
 		scopedLogger.Debug().Msg("closing existing vpn socket connection")
 		vpnSocketConn.Close()
 	}
-
 	vpnSocketConn = conn
+	vpnConnWriteLock.Unlock()
 
 	readBuf := make([]byte, 4096)
 	for {

@@ -177,13 +177,13 @@ func resetIOInput() error {
 func initGPIO() {
 	LoadConfig()
 	// IO0: GPIO58 IO1: GPIO59
-	_ = setGPIOValue(58, config.IO0Status)
-	_ = setGPIOValue(59, config.IO1Status)
+	_ = setGPIOValue(58, configSnapshot().IO0Status)
+	_ = setGPIOValue(59, configSnapshot().IO1Status)
 
 	// IO2: GPIO0 IO3: GPIO1 - Input
 	_ = setGPIODirection(0, "in")
 	_ = setGPIODirection(1, "in")
 
-	_ = setLedMode(ledYellowPath, config.LEDYellowMode)
-	_ = setLedMode(ledGreenPath, config.LEDGreenMode)
+	_ = setLedMode(ledYellowPath, configSnapshot().LEDYellowMode)
+	_ = setLedMode(ledGreenPath, configSnapshot().LEDGreenMode)
 }

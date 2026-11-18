@@ -42,7 +42,7 @@ func isTimeSyncNeeded() bool {
 func initTimeSync() {
 	timeSync = timesync.NewTimeSync(&timesync.TimeSyncOptions{
 		Logger:        timesyncLogger,
-		NetworkConfig: config.NetworkConfig,
+		NetworkConfig: configSnapshot().NetworkConfig,
 		PreCheckFunc: func() (bool, error) {
 			if !networkState.IsOnline() {
 				return false, nil
@@ -54,7 +54,7 @@ func initTimeSync() {
 
 func initTimeZone() {
 	LoadConfig()
-	_, err := CallDisplayCtrlAction("set_timezone", map[string]interface{}{"timezone": config.TimeZone})
+	_, err := CallDisplayCtrlAction("set_timezone", map[string]interface{}{"timezone": configSnapshot().TimeZone})
 	if err != nil {
 		timesyncLogger.Error().Err(err).Msg("failed to set time zone")
 	}

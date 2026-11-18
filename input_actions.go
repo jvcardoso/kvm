@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // This file is the single place where the HTTP surfaces (the local CLI API and
@@ -289,38 +291,99 @@ func keyModifier(name string) (uint8, bool) {
 	return bit, ok
 }
 
-// typeASCIIText types the text one character at a time. The whole string is
-// validated first, so a rejected character never leaves half of the text
-// already typed on the remote host. A non-zero delay is inserted between two
-// keystrokes because the remote USB HID stack drops keys when reports are sent
-// back to back.
+type textKeystroke struct {
+	code, modifier uint8
+}
+
+var abnt2Symbols = map[rune]textKeystroke{
+	'\'': {0x35, 0}, '"': {0x35, 2},
+	'[': {0x30, 0}, '{': {0x30, 2},
+	']': {0x31, 0}, '}': {0x31, 2}, 'º': {0x31, 0x40},
+	'ç': {0x33, 0}, 'Ç': {0x33, 2},
+	'\\': {0x64, 0}, '|': {0x64, 2},
+	';': {0x38, 0}, ':': {0x38, 2},
+	'/': {0x14, 0x40}, '?': {0x1A, 0x40},
+	'¹': {0x1E, 0x40}, '²': {0x1F, 0x40}, '³': {0x20, 0x40},
+	'£': {0x21, 0x40}, '¢': {0x22, 0x40}, '¬': {0x23, 0x40},
+	'§': {0x2E, 0x40}, 'ª': {0x30, 0x40},
+	'\n': {0x28, 0}, '\t': {0x2B, 0},
+}
+
+var abnt2DeadKeys = map[rune]textKeystroke{
+	'\u0301': {0x2F, 0}, // acute
+	'\u0300': {0x2F, 2}, // grave
+	'\u0308': {0x23, 2}, // diaeresis
+	'\u0303': {0x34, 0}, // tilde
+	'\u0302': {0x34, 2}, // circumflex
+}
+
+var abnt2StandaloneAccents = map[rune]rune{
+	'´': '\u0301', '`': '\u0300', '¨': '\u0308', '~': '\u0303', '^': '\u0302',
+}
+
+func abnt2TextKeystrokes(strokes []textKeystroke, char rune) ([]textKeystroke, bool) {
+	if stroke, ok := abnt2Symbols[char]; ok {
+		return append(strokes, stroke), true
+	}
+	if accent, ok := abnt2StandaloneAccents[char]; ok {
+		return append(strokes, abnt2DeadKeys[accent], textKeystroke{0x2C, 0}), true
+	}
+	if char <= 0x7F {
+		code, modifier, ok := charToKeyCode(uint8(char))
+		if ok {
+			return append(strokes, textKeystroke{code, modifier}), true
+		}
+		return strokes, true
+	}
+
+	base := []rune(norm.NFD.String(string(char)))
+	if len(base) == 2 && strings.ContainsRune("aeiounAEIOUN", base[0]) {
+		if dead, ok := abnt2DeadKeys[base[1]]; ok {
+			code, modifier, _ := charToKeyCode(uint8(base[0]))
+			return append(strokes, dead, textKeystroke{code, modifier}), true
+		}
+	}
+	return strokes, false
+}
+
 func typeASCIIText(text string, delay time.Duration) error {
+	return typeKeyboardText(text, "", delay)
+}
+
+// Validate all characters before sending the first HID report.
+func typeKeyboardText(text, layout string, delay time.Duration) error {
+	abnt2 := strings.EqualFold(strings.ReplaceAll(layout, "_", "-"), "pt-BR")
+	if abnt2 {
+		text = norm.NFC.String(strings.ReplaceAll(text, "\r\n", "\n"))
+	}
 	runes := []rune(text)
 	if len(runes) > maxTypeTextLength {
 		return fmt.Errorf("text is longer than %d characters", maxTypeTextLength)
 	}
 
-	codes := make([]uint8, 0, len(runes))
-	modifiers := make([]uint8, 0, len(runes))
+	strokes := make([]textKeystroke, 0, len(runes))
 	for i, char := range runes {
-		if char > 0x7F {
-			return fmt.Errorf("unsupported non-ASCII character %q at index %d, only ASCII text can be typed", char, i)
+		if abnt2 {
+			var ok bool
+			strokes, ok = abnt2TextKeystrokes(strokes, char)
+			if !ok {
+				return fmt.Errorf("unsupported ABNT2 character %q at index %d", char, i)
+			}
+		} else {
+			if char > 0x7F {
+				return fmt.Errorf("unsupported character %q at index %d; select pt-BR for ABNT2 characters", char, i)
+			}
+			if code, modifier, ok := charToKeyCode(uint8(char)); ok {
+				strokes = append(strokes, textKeystroke{code, modifier})
+			}
 		}
-		code, modifier, ok := charToKeyCode(uint8(char))
-		if !ok {
-			continue
-		}
-		codes = append(codes, code)
-		modifiers = append(modifiers, modifier)
 	}
 
-	for i := range codes {
-		if err := tapKeys(modifiers[i], []uint8{codes[i]}); err != nil {
+	for i, stroke := range strokes {
+		if err := tapKeys(stroke.modifier, []uint8{stroke.code}); err != nil {
 			return err
 		}
-		// tapKeys already waited reportGap after the press, so only the rest of the
-		// requested rhythm has to be added
-		if gap := delay - reportGap; gap > 0 && i < len(codes)-1 {
+		if gap := delay - reportGap; gap > 0 && i < len(strokes)-1 {
 			time.Sleep(gap)
 		}
 	}

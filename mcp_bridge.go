@@ -45,7 +45,11 @@ func (mcpInput) ParseCombo(names []string) (uint8, []uint8, error) {
 }
 
 func (mcpInput) TypeText(text string, delay time.Duration) error {
-	return typeASCIIText(text, delay)
+	layout, err := rpcGetKeyboardLayout()
+	if err != nil {
+		return err
+	}
+	return typeKeyboardText(text, layout, delay)
 }
 
 func (mcpInput) AbsPosition() (int, int) { return gadget.GetAbsMousePosition() }
@@ -124,12 +128,13 @@ func (mcpScreen) State() (mcp.VideoState, error) {
 // mcpKeyStore adapts the saved configuration.
 type mcpKeyStore struct{}
 
-func (mcpKeyStore) APIKey() string { return config.APIKey }
-func (mcpKeyStore) Enabled() bool  { return !config.MCPDisabled }
+func (mcpKeyStore) APIKey() string { return configSnapshot().APIKey }
+func (mcpKeyStore) Enabled() bool  { return !configSnapshot().MCPDisabled }
 
 func (mcpKeyStore) SetEnabled(enabled bool) error {
-	config.MCPDisabled = !enabled
-	return SaveConfig()
+	return updateConfig(func(next *Config) {
+		next.MCPDisabled = !enabled
+	})
 }
 
 func (mcpKeyStore) RegenerateKey() (string, error) {
@@ -137,8 +142,9 @@ func (mcpKeyStore) RegenerateKey() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	config.APIKey = key
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.APIKey = key
+	}); err != nil {
 		return "", err
 	}
 	return key, nil
@@ -161,6 +167,6 @@ func initMCP() {
 
 	// seed the live state early: the server itself starts in a goroutine, but
 	// the management API can be queried before that
-	mcp.ApplyAPIKey(config.APIKey)
-	mcp.PublishEnabled(!config.MCPDisabled)
+	mcp.ApplyAPIKey(configSnapshot().APIKey)
+	mcp.PublishEnabled(!configSnapshot().MCPDisabled)
 }

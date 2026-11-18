@@ -108,9 +108,9 @@ func registerTools(s *server.MCPServer) {
 	), auditTool("keyboard_combo", handleKeyboardCombo))
 
 	s.AddTool(tool("type_text", inputInput,
-		mcp.WithDescription("Type an ASCII text string into the remote host"),
+		mcp.WithDescription("Type text into the remote host using US ASCII or the configured Brazilian ABNT2 layout"),
 		mcp.WithString("text", mcp.Required(),
-			mcp.Description(fmt.Sprintf("Text to type, ASCII only, at most %d characters", maxText))),
+			mcp.Description(fmt.Sprintf("Text to type, at most %d characters. Select pt-BR on the KVM and remote host for Brazilian accents and ç", maxText))),
 		mcp.WithNumber("delayMs", mcp.Description("Delay between two keystrokes in ms, 0..1000, default 30")),
 	), auditTool("type_text", handleTypeText))
 

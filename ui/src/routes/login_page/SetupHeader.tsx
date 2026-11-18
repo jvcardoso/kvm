@@ -59,6 +59,7 @@ const SetupHeader: React.FC<SetupHeaderProps> = ({
             size="small"
           >
             <Option value="en">English</Option>
+            <Option value="pt">Português</Option>
             <Option value="zh">中文</Option>
           </Select>
         </Space>
@@ -98,6 +99,7 @@ const SetupHeader: React.FC<SetupHeaderProps> = ({
             size="small"
           >
             <Option value="en">English</Option>
+            <Option value="pt">Português</Option>
             <Option value="zh">中文</Option>
           </Select>
         </Space>

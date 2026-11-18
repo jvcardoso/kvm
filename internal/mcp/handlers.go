@@ -452,7 +452,15 @@ func handleTypeText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 
 	// a typed string is the one call that keeps the keyboard for a long time,
 	// so its lease is sized from the text and the delay
-	hold := HoldForText(len([]rune(text)), delay)
+	strokes := 0
+	for _, char := range text {
+		strokes++
+		// An accented letter or standalone accent may need two HID taps.
+		if char > 0x7F || char == '~' || char == '^' || char == '`' {
+			strokes++
+		}
+	}
+	hold := HoldForText(strokes, delay)
 	return withInput("type_text", hold, func() (*mcp.CallToolResult, error) {
 		// TypeText validates the whole string before the first keystroke, so a
 		// rejected character never leaves half of the text on the remote host.

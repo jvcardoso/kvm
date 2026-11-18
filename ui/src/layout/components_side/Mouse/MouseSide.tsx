@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Checkbox, Slider } from "antd";
 import { useReactAt } from "i18n-auto-extractor/react";
+import { isMobile } from "react-device-detect";
 
 import { SettingsItem, SettingsItemNew } from "@components/Settings/SettingsView";
 import SettingsSelect from "@components/Settings/SettingsSelect";
@@ -88,6 +89,13 @@ export default function MouseSide() {
       onKeyDown={e => e.stopPropagation()}
     >
       <div className="space-y-4">
+        {isMobile && mouseMode !== "touch-screen" && (
+          <div className="rounded-lg bg-blue-500/10 p-3 text-sm text-black dark:text-white">
+            <p>{$at("One finger moves the cursor. Tap to click.")}</p>
+            <p>{$at("Hold for right click. Double-tap and drag on the second touch to drag.")}</p>
+            <p>{$at("Use two fingers to zoom and move the image, or switch to scrolling.")}</p>
+          </div>
+        )}
         <SettingsItem
           title={$at("Input Modes")}
           description={inputModeDescription ? $at(inputModeDescription) : ""}

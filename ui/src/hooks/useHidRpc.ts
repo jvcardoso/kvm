@@ -246,7 +246,7 @@ export function useHidRpc(onHidRpcMessage?: (payload: RpcMessage) => void) {
 
   const reportKeyboardEvent = useCallback(
     (keys: number[], modifier: number) => {
-      sendMessage(new KeyboardReportMessage(keys, modifier));
+      return sendMessage(new KeyboardReportMessage(keys, modifier));
     },
     [sendMessage],
   );

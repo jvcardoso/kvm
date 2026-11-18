@@ -36,9 +36,10 @@ func (w *logOutput) Write(p []byte) (n int, err error) {
 
 	// TODO: write to file or syslog
 	if sseServer != nil {
-		// use a goroutine to avoid blocking the Write method
+		// Copy the event before zerolog recycles its backing buffer.
+		message := string(p)
 		go func() {
-			sseServer.Message <- string(p)
+			sseServer.Message <- message
 		}()
 	}
 	return len(p), nil

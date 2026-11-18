@@ -63,6 +63,16 @@ const PowerControlUp: React.FC = () => {
     }
   };
 
+  const handleForcePowerClick = () => {
+    send("triggerForcePower", {}, (resp) => {
+      if ("error" in resp) {
+        notifications.error("Failed to trigger force power off");
+      } else {
+        notifications.success("Force power off (5s pulse) triggered");
+      }
+    });
+  };
+
   const handleResetClick = () => {
     if (isLatchMode) {
       const newState = !resetState;
@@ -134,6 +144,27 @@ const PowerControlUp: React.FC = () => {
           {$at("Reset")}
         </Button>
       </div>
+
+      {!isLatchMode && (
+        <div style={{ width: "100%", display: "flex", marginTop: 12 }}>
+          <Button
+            danger
+            icon={<PoweroffOutlined />}
+            size="large"
+            onClick={handleForcePowerClick}
+            style={{
+              width: "100%",
+              height: 36,
+              fontSize: "15px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            {$at("Force Power Off (5s)")}
+          </Button>
+        </div>
+      )}
 
       {!isConnected && (
         <>

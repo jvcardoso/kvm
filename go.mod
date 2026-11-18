@@ -23,7 +23,6 @@ require (
 	github.com/prometheus/client_golang v1.22.0
 	github.com/prometheus/common v0.62.0
 	github.com/prometheus/procfs v0.16.1
-	github.com/psanford/httpreadat v0.1.0
 	github.com/rs/zerolog v1.34.0
 	github.com/sourcegraph/tf-dag v0.2.2-0.20250131204052-3e8ff1477b4f
 	github.com/spf13/cobra v1.10.2
@@ -33,6 +32,7 @@ require (
 	golang.org/x/crypto v0.39.0
 	golang.org/x/net v0.41.0
 	golang.org/x/sys v0.33.0
+	golang.org/x/text v0.26.0
 )
 
 replace github.com/pojntfx/go-nbd v0.3.2 => github.com/chemhack/go-nbd v0.0.0-20241006125820-59e45f5b1e7b
@@ -87,7 +87,6 @@ require (
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	golang.org/x/arch v0.17.0 // indirect
-	golang.org/x/text v0.26.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

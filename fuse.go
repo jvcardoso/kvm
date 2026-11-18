@@ -53,11 +53,11 @@ func (f *WebRTCStreamFile) Flush(ctx context.Context, fh fs.FileHandle) syscall.
 }
 
 type DiskReadRequest struct {
-	Start uint64 `json:"start"`
-	End   uint64 `json:"end"`
+	ID         string `json:"id"`
+	Generation string `json:"generation"`
+	Start      uint64 `json:"start"`
+	End        uint64 `json:"end"`
 }
-
-var diskReadChan = make(chan []byte, 1)
 
 func (f *WebRTCStreamFile) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	buf, err := webRTCDiskReader.Read(ctx, off, int64(len(dest)))

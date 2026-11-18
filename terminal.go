@@ -98,6 +98,11 @@ func handleTerminalChannel(d *webrtc.DataChannel) {
 }
 
 func handleTerminalWS(c *gin.Context) {
+	if !isAllowedWebSocketOrigin(c.Request) {
+		c.JSON(403, gin.H{"error": "cross-origin websocket request rejected"})
+		return
+	}
+
 	source := c.ClientIP()
 	scopedLogger := terminalLogger.With().
 		Str("transport", "websocket").

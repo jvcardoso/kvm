@@ -16,17 +16,18 @@ import (
 var appCtx context.Context
 
 func Main() {
-	SyncConfigSD(true)
+	importConfigSD()
 	LoadConfig()
 	cleanupStaleLocalPackageOnStartup()
 
-	if config.APIKey == "" {
+	if configSnapshot().APIKey == "" {
 		key, err := generateAPIKey()
 		if err != nil {
 			logger.Warn().Err(err).Msg("failed to generate API key")
 		} else {
-			config.APIKey = key
-			if err := SaveConfig(); err != nil {
+			if err := updateConfig(func(next *Config) {
+				next.APIKey = key
+			}); err != nil {
 				logger.Warn().Err(err).Msg("failed to save API key to config")
 			} else {
 				logger.Info().Msg("generated new API key")
@@ -77,7 +78,7 @@ func Main() {
 		os.Exit(1)
 	}
 
-	if err := ApplyFirewallConfig(config.Firewall); err != nil {
+	if err := ApplyFirewallConfig(configSnapshot().Firewall); err != nil {
 		logger.Warn().Err(err).Msg("failed to apply firewall config")
 	}
 
@@ -194,7 +195,7 @@ func Main() {
 
 	go RunWebSecureServer()
 	// Web secure server is started only if TLS mode is enabled
-	if config.TLSMode != "" {
+	if configSnapshot().TLSMode != "" {
 		startWebSecureServer()
 	}
 

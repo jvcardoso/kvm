@@ -10,10 +10,12 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kvm/internal/logging"
@@ -207,7 +209,18 @@ func setupRouter() *gin.Engine {
 	return r
 }
 
-var currentSession *Session
+var currentSession atomic.Pointer[Session]
+
+func replaceCurrentSession(session *Session) {
+	if previous := currentSession.Swap(session); previous != nil {
+		invalidateWebRTCMedia(previous, nil)
+		writeJSONRPCEvent("otherSessionConnected", nil, previous)
+		go func() {
+			time.Sleep(time.Second)
+			_ = previous.peerConnection.Close()
+		}()
+	}
+}
 
 var (
 	currentHTTPSessionID    string
@@ -237,15 +250,7 @@ func handleWebRTCSession(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err})
 		return
 	}
-	if currentSession != nil {
-		writeJSONRPCEvent("otherSessionConnected", nil, currentSession)
-		peerConn := currentSession.peerConnection
-		go func() {
-			time.Sleep(1 * time.Second)
-			_ = peerConn.Close()
-		}()
-	}
-	currentSession = session
+	replaceCurrentSession(session)
 	c.JSON(http.StatusOK, gin.H{"sd": sd})
 }
 
@@ -336,7 +341,27 @@ var (
 	)
 )
 
+// isAllowedWebSocketOrigin verifies that a browser-initiated WebSocket request
+// originates from the same host, preventing Cross-Site WebSocket Hijacking (CSWSH).
+// Non-browser clients without an Origin header are permitted.
+func isAllowedWebSocketOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
 func handleLocalWebRTCSignal(c *gin.Context) {
+	if !isAllowedWebSocketOrigin(c.Request) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "cross-origin websocket request rejected"})
+		return
+	}
+
 	// get the source from the request
 	source := c.ClientIP()
 
@@ -525,13 +550,14 @@ func handleWebRTCSignalWsMessages(
 
 			l.Info().Str("data", fmt.Sprintf("%v", candidate)).Msg("unmarshalled incoming ICE candidate")
 
-			if currentSession == nil {
+			active := currentSession.Load()
+			if active == nil {
 				l.Warn().Msg("no current session, skipping incoming ICE candidate")
 				continue
 			}
 
 			l.Info().Str("data", fmt.Sprintf("%v", candidate)).Msg("adding incoming ICE candidate to current session")
-			if err = currentSession.peerConnection.AddICECandidate(candidate); err != nil {
+			if err = active.peerConnection.AddICECandidate(candidate); err != nil {
 				l.Warn().Str("error", err.Error()).Msg("failed to add incoming ICE candidate to our peer connection")
 			}
 		}
@@ -539,7 +565,7 @@ func handleWebRTCSignalWsMessages(
 }
 
 func handleLogin(c *gin.Context) {
-	if config.LocalAuthMode == "noPassword" {
+	if configSnapshot().LocalAuthMode == "noPassword" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Login is disabled in noPassword mode"})
 		return
 	}
@@ -567,7 +593,7 @@ func handleLogin(c *gin.Context) {
 		return
 	}
 
-	err := bcrypt.CompareHashAndPassword([]byte(config.HashedPassword), []byte(req.Password))
+	err := bcrypt.CompareHashAndPassword([]byte(configSnapshot().HashedPassword), []byte(req.Password))
 	if err != nil {
 		RecordFailure(ip)
 		RecordGlobalFailure()
@@ -614,7 +640,7 @@ func devModeOnlyMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		if config.LocalAuthMode != "noPassword" {
+		if configSnapshot().LocalAuthMode != "noPassword" {
 			if !validLocalSession(cookieValue(c, "authToken")) {
 				c.AbortWithStatus(http.StatusNotFound)
 				return
@@ -646,7 +672,7 @@ func clampProfileSeconds(handler http.HandlerFunc, maxSeconds int) gin.HandlerFu
 
 func protectedMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if config.LocalAuthMode == "noPassword" {
+		if configSnapshot().LocalAuthMode == "noPassword" {
 			c.Next()
 			return
 		}
@@ -682,7 +708,7 @@ func basicAuthProtectedMiddleware(requireDeveloperMode bool) gin.HandlerFunc {
 			}
 		}
 
-		if config.LocalAuthMode == "noPassword" {
+		if configSnapshot().LocalAuthMode == "noPassword" {
 			sendErrorJsonThenAbort(c, http.StatusForbidden, "The resource is not available in noPassword mode")
 			return
 		}
@@ -705,7 +731,7 @@ func basicAuthProtectedMiddleware(requireDeveloperMode bool) gin.HandlerFunc {
 			return
 		}
 
-		err := bcrypt.CompareHashAndPassword([]byte(config.HashedPassword), []byte(password))
+		err := bcrypt.CompareHashAndPassword([]byte(configSnapshot().HashedPassword), []byte(password))
 		if err != nil {
 			RecordFailure(ip)
 			RecordGlobalFailure()
@@ -724,11 +750,11 @@ func RunWebServer() {
 
 	// Determine the binding address based on the config
 	bindAddress := ":80" // Default to all interfaces
-	if config.LocalLoopbackOnly {
+	if configSnapshot().LocalLoopbackOnly {
 		bindAddress = "localhost:80" // Loopback only (both IPv4 and IPv6)
 	}
 
-	logger.Info().Str("bindAddress", bindAddress).Bool("loopbackOnly", config.LocalLoopbackOnly).Msg("Starting web server")
+	logger.Info().Str("bindAddress", bindAddress).Bool("loopbackOnly", configSnapshot().LocalLoopbackOnly).Msg("Starting web server")
 	err := r.Run(bindAddress)
 	if err != nil {
 		panic(err)
@@ -737,16 +763,20 @@ func RunWebServer() {
 
 func handleDevice(c *gin.Context) {
 	response := LocalDevice{
-		AuthMode:     &config.LocalAuthMode,
+		AuthMode:     &configSnapshot().LocalAuthMode,
 		DeviceID:     GetDeviceID(),
-		LoopbackOnly: config.LocalLoopbackOnly,
+		LoopbackOnly: configSnapshot().LocalLoopbackOnly,
 	}
 
 	c.JSON(http.StatusOK, response)
 }
 
+var authConfigMutex sync.Mutex
+
 func handleCreatePassword(c *gin.Context) {
-	if config.HashedPassword != "" {
+	authConfigMutex.Lock()
+	defer authConfigMutex.Unlock()
+	if configSnapshot().HashedPassword != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Password already set"})
 		return
 	}
@@ -754,7 +784,7 @@ func handleCreatePassword(c *gin.Context) {
 	// We only allow users with noPassword mode to set a new password
 	// Users with password mode are not allowed to set a new password without providing the old password
 	// We have a PUT endpoint for changing the password, use that instead
-	if config.LocalAuthMode != "noPassword" {
+	if configSnapshot().LocalAuthMode != "noPassword" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Password mode is not enabled"})
 		return
 	}
@@ -771,10 +801,11 @@ func handleCreatePassword(c *gin.Context) {
 		return
 	}
 
-	config.HashedPassword = string(hashedPassword)
-	config.LocalAuthToken = ""
-	config.LocalAuthMode = "password"
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.HashedPassword = string(hashedPassword)
+		next.LocalAuthToken = ""
+		next.LocalAuthMode = "password"
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
 		return
 	}
@@ -790,14 +821,16 @@ func handleCreatePassword(c *gin.Context) {
 }
 
 func handleUpdatePassword(c *gin.Context) {
-	if config.HashedPassword == "" {
+	authConfigMutex.Lock()
+	defer authConfigMutex.Unlock()
+	if configSnapshot().HashedPassword == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Password is not set"})
 		return
 	}
 
 	// We only allow users with password mode to change their password
 	// Users with noPassword mode are not allowed to change their password
-	if config.LocalAuthMode != "password" {
+	if configSnapshot().LocalAuthMode != "password" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Password mode is not enabled"})
 		return
 	}
@@ -808,7 +841,7 @@ func handleUpdatePassword(c *gin.Context) {
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(config.HashedPassword), []byte(req.OldPassword)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(configSnapshot().HashedPassword), []byte(req.OldPassword)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Incorrect old password"})
 		return
 	}
@@ -819,9 +852,10 @@ func handleUpdatePassword(c *gin.Context) {
 		return
 	}
 
-	config.HashedPassword = string(hashedPassword)
-	config.LocalAuthToken = ""
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.HashedPassword = string(hashedPassword)
+		next.LocalAuthToken = ""
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
 		return
 	}
@@ -840,12 +874,14 @@ func handleUpdatePassword(c *gin.Context) {
 }
 
 func handleDeletePassword(c *gin.Context) {
-	if config.HashedPassword == "" {
+	authConfigMutex.Lock()
+	defer authConfigMutex.Unlock()
+	if configSnapshot().HashedPassword == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Password is not set"})
 		return
 	}
 
-	if config.LocalAuthMode != "password" {
+	if configSnapshot().LocalAuthMode != "password" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Password mode is not enabled"})
 		return
 	}
@@ -856,16 +892,17 @@ func handleDeletePassword(c *gin.Context) {
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(config.HashedPassword), []byte(req.Password)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(configSnapshot().HashedPassword), []byte(req.Password)); err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Incorrect password"})
 		return
 	}
 
 	// Disable password
-	config.HashedPassword = ""
-	config.LocalAuthToken = ""
-	config.LocalAuthMode = "noPassword"
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.HashedPassword = ""
+		next.LocalAuthToken = ""
+		next.LocalAuthMode = "noPassword"
+	}); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save configuration"})
 		return
 	}
@@ -878,7 +915,7 @@ func handleDeletePassword(c *gin.Context) {
 
 func handleDeviceStatus(c *gin.Context) {
 	response := DeviceStatus{
-		IsSetup: config.LocalAuthMode != "",
+		IsSetup: configSnapshot().LocalAuthMode != "",
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -899,8 +936,10 @@ func handleDeviceUIConfig(c *gin.Context) {
 }
 
 func handleSetup(c *gin.Context) {
+	authConfigMutex.Lock()
+	defer authConfigMutex.Unlock()
 	// Check if the device is already set up
-	if config.LocalAuthMode != "" || config.HashedPassword != "" {
+	if configSnapshot().LocalAuthMode != "" || configSnapshot().HashedPassword != "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Device is already set up"})
 		return
 	}
@@ -917,7 +956,7 @@ func handleSetup(c *gin.Context) {
 		return
 	}
 
-	config.LocalAuthMode = req.LocalAuthMode
+	var passwordHash string
 
 	if req.LocalAuthMode == "password" {
 		if req.Password == "" {
@@ -932,21 +971,19 @@ func handleSetup(c *gin.Context) {
 			return
 		}
 
-		config.HashedPassword = string(hashedPassword)
-		config.LocalAuthToken = ""
-	} else {
-		// For noPassword mode, ensure the password field is empty
-		config.HashedPassword = ""
-		config.LocalAuthToken = ""
+		passwordHash = string(hashedPassword)
 	}
-
-	err := SaveConfig()
+	err := updateConfig(func(next *Config) {
+		next.LocalAuthMode = req.LocalAuthMode
+		next.HashedPassword = passwordHash
+		next.LocalAuthToken = ""
+	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save config"})
 		return
 	}
 
-	if config.LocalAuthMode == "password" {
+	if configSnapshot().LocalAuthMode == "password" {
 		token, tokenErr := newLocalSession()
 		if tokenErr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create session"})
@@ -1117,7 +1154,17 @@ func handleGetIceServers(c *gin.Context) {
 func handleVideoStream(c *gin.Context) {
 	logger.Info().Msg("HTTP video stream request received")
 
-	c.Header("Content-Type", "video/x-h264")
+	usesHEVC := streamUsesHEVC.Load()
+	if usesHEVC {
+		c.Header("Content-Type", "video/x-h265")
+		c.Writer.Header().Set("X-Video-Codec", "h265")
+	} else {
+		c.Header("Content-Type", "video/x-h264")
+		c.Writer.Header().Set("X-Video-Codec", "h264")
+	}
+	if video, _ := rpcGetVideoState(); video.Ready && video.FramePerSecond > 0 {
+		c.Header("X-Video-FPS", fmt.Sprintf("%.3f", video.FramePerSecond))
+	}
 	c.Writer.Header().Set("X-Content-Type-Options", "nosniff")
 	c.Writer.Header().Set("Cache-Control", "no-cache")
 	c.Writer.Header().Set("Connection", "keep-alive")
@@ -1141,6 +1188,10 @@ func handleVideoStream(c *gin.Context) {
 		case frame, ok := <-ch:
 			if !ok {
 				logger.Info().Int("total_frames", frameCount).Msg("video broadcaster channel closed")
+				return
+			}
+			if streamUsesHEVC.Load() != usesHEVC {
+				frame.Release()
 				return
 			}
 			data := frame.Data()
@@ -1195,18 +1246,10 @@ func handleSessionRequest(
 		_ = wsjson.Write(context.Background(), c, gin.H{"error": err})
 		return err
 	}
-	if currentSession != nil {
-		writeJSONRPCEvent("otherSessionConnected", nil, currentSession)
-		peerConn := currentSession.peerConnection
-		go func() {
-			time.Sleep(1 * time.Second)
-			_ = peerConn.Close()
-		}()
-	}
 
 	logger.Info().Interface("session", session).Msg("new session accepted")
 	logger.Trace().Interface("session", session).Msg("new session accepted")
-	currentSession = session
+	replaceCurrentSession(session)
 	_ = wsjson.Write(context.Background(), c, gin.H{"type": "answer", "data": sd})
 	return nil
 }

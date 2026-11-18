@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useReactAt } from "i18n-auto-extractor/react";
 import { BsPin, BsPinFill } from "react-icons/bs";
+import { isMobile } from "react-device-detect";
 
 import { useUiStore } from "@/hooks/stores";
 import { dark_font_style, text_primary_color } from "@/layout/theme_color";
@@ -194,7 +195,7 @@ export function BarsHiddenHandle({
       title={label}
       aria-label={label}
       onClick={revealBars}
-      className="absolute left-1/2 top-0 z-40 flex h-9 w-24 -translate-x-1/2 items-center justify-center border-0 bg-transparent"
+      className="absolute left-1/2 top-[env(safe-area-inset-top)] z-40 flex h-11 w-24 -translate-x-1/2 items-center justify-center border-0 bg-transparent"
     >
       <span className="block h-[5px] w-14 rounded-full bg-white shadow-[0_1px_4px_rgba(0,0,0,0.45)]" />
     </button>
@@ -220,7 +221,7 @@ export function BarsPinButton({ fontSize = 16 }: { fontSize?: number }) {
       aria-label={label}
       aria-pressed={barsPinned}
       onClick={() => setBarsPinned(!barsPinned)}
-      className={`flex shrink-0 cursor-pointer items-center border-0 bg-transparent px-2 transition-colors duration-200 ${
+      className={`flex ${isMobile ? "min-h-11 min-w-11 justify-center" : ""} shrink-0 cursor-pointer items-center border-0 bg-transparent px-2 transition-colors duration-200 ${
         barsPinned ? text_primary_color : `text-black ${dark_font_style}`
       }`}
     >

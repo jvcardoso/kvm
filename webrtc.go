@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kvm/internal/logging"
@@ -23,11 +24,10 @@ type Session struct {
 	VideoTrack     *webrtc.TrackLocalStaticSample
 	AudioTrack     *webrtc.TrackLocalStaticRTP
 	//AudioTrack               *webrtc.TrackLocalStaticSample
-	ControlChannel           *webrtc.DataChannel
-	RPCChannel               *webrtc.DataChannel
-	DiskChannel              *webrtc.DataChannel
-	HidChannel               *webrtc.DataChannel
-	shouldUmountVirtualMedia bool
+	ControlChannel *webrtc.DataChannel
+	RPCChannel     *webrtc.DataChannel
+	diskChannel    atomic.Pointer[webrtc.DataChannel]
+	HidChannel     *webrtc.DataChannel
 
 	// hidRPCAvailable is set once the client completes the HID RPC handshake.
 	hidRPCAvailable bool
@@ -205,17 +205,15 @@ type SessionConfig struct {
 const DefaultSTUN = "stun:stun.l.google.com:19302"
 
 func buildICEServers() []webrtc.ICEServer {
-	if config == nil {
-		LoadConfig()
-	}
-
-	stunURL := config.STUN
+	ensureConfigLoaded()
+	cfg := configSnapshot()
+	stunURL := cfg.STUN
 	if stunURL == "" {
 		stunURL = DefaultSTUN
 	}
 
 	servers := []webrtc.ICEServer{{URLs: []string{stunURL}}}
-	for _, turnServer := range config.TurnServers {
+	for _, turnServer := range cfg.TurnServers {
 		if turnServer.URL == "" {
 			continue
 		}
@@ -317,8 +315,22 @@ func newSession(sessionConfig SessionConfig) (*Session, error) {
 			triggerVideoStateUpdate()
 			triggerUSBStateUpdate()
 		case "disk":
-			session.DiskChannel = d
-			d.OnMessage(onDiskMessage)
+			if !session.diskChannel.CompareAndSwap(nil, d) {
+				_ = d.Close()
+				return
+			}
+			d.OnMessage(func(msg webrtc.DataChannelMessage) {
+				if !msg.IsString {
+					webRTCDiskReader.receiveChunk(d, msg.Data)
+				}
+			})
+			d.OnClose(func() {
+				session.diskChannel.CompareAndSwap(d, nil)
+				invalidateWebRTCMedia(session, d)
+				if err := unmountImageForSession(false, session, d); err != nil {
+					scopedLogger.Warn().Err(err).Msg("failed to unmount closed WebRTC media")
+				}
+			})
 		case "terminal":
 			handleTerminalChannel(d)
 		case "serial":
@@ -330,7 +342,7 @@ func newSession(sessionConfig SessionConfig) (*Session, error) {
 		}
 	})
 
-	if streamEncodecType == "hevc" {
+	if streamUsesHEVC.Load() {
 		session.VideoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH265}, "video", "kvm")
 	} else {
 		session.VideoTrack, err = webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video", "kvm")
@@ -409,12 +421,10 @@ func newSession(sessionConfig SessionConfig) (*Session, error) {
 		if connectionState == webrtc.ICEConnectionStateClosed {
 			scopedLogger.Debug().Msg("ICE Connection State is closed, unmounting virtual media")
 			session.closeSignals()
-			if session == currentSession {
-				currentSession = nil
-			}
-			if session.shouldUmountVirtualMedia {
-				err := unmountImage(false)
-				scopedLogger.Warn().Err(err).Msg("unmount image failed on connection close")
+			currentSession.CompareAndSwap(session, nil)
+			invalidateWebRTCMedia(session, nil)
+			if err := unmountImageForSession(false, session, nil); err != nil {
+				scopedLogger.Warn().Err(err).Msg("failed to unmount closed WebRTC media")
 			}
 			if isConnected {
 				isConnected = false
@@ -437,7 +447,7 @@ func onActiveSessionsChanged() {
 
 func onFirstSessionConnected() {
 	_ = writeCtrlAction("start_video")
-	if config.AudioMode != "disabled" {
+	if configSnapshot().AudioMode != "disabled" {
 		StartNtpAudioServer(handleAudioClient)
 	}
 }

@@ -95,7 +95,7 @@ func (u *UsbGadget) isGadgetConfigItemEnabled(itemKey string) bool {
 	case "relative_mouse":
 		return u.enabledDevices.RelativeMouse
 	case "pen_touch":
-		return u.enabledDevices.AbsoluteMouse
+		return u.HasPenTouch()
 	case "keyboard":
 		return u.enabledDevices.Keyboard
 	case "mass_storage_base":
@@ -276,12 +276,6 @@ func (u *UsbGadget) Init() error {
 
 	u.udc = udcs[0]
 
-	if err := u.ensureGadgetUnbound(); err != nil {
-		u.log.Warn().Err(err).Msg("failed to ensure gadget is unbound, will continue")
-	} else {
-		u.log.Info().Msg("gadget unbind check completed")
-	}
-
 	err := u.configureUsbGadget(false)
 	if err != nil {
 		u.log.Error().Err(err).
@@ -329,7 +323,7 @@ func (u *UsbGadget) ensureGadgetUnbound() error {
 	time.Sleep(200 * time.Millisecond)
 
 	if content, err := os.ReadFile(udcPath); err == nil {
-		if strings.TrimSpace(string(content)) != "none" {
+		if trimmed := strings.TrimSpace(string(content)); trimmed != "" && trimmed != "none" {
 			u.log.Warn().Msg("UDC still bound after unbind attempt")
 		}
 	}
@@ -357,6 +351,12 @@ func (u *UsbGadget) configureUsbGadget(resetUsb bool) error {
 		Msg("configuring USB gadget via transaction")
 
 	return u.withHIDRebind(func() error {
+		if err := u.ensureGadgetUnbound(); err != nil {
+			u.log.Warn().Err(err).Msg("failed to ensure gadget is unbound, will continue")
+		} else {
+			u.log.Info().Msg("gadget unbind check completed")
+		}
+
 		return u.WithTransaction(func() error {
 			u.log.Info().Msg("Transaction: Mounting configfs")
 			u.tx.MountConfigFS()
@@ -367,10 +367,6 @@ func (u *UsbGadget) configureUsbGadget(resetUsb bool) error {
 			u.log.Info().Msg("Transaction: Writing gadget configuration")
 			u.tx.WriteGadgetConfig()
 
-			if resetUsb {
-				u.log.Info().Msg("Transaction: Rebinding USB")
-				u.tx.RebindUsb(true)
-			}
 			return nil
 		})
 	})

@@ -75,7 +75,7 @@ func StartNtpAudioServer(handleClient func(net.Conn)) {
 	audioListener = listener
 	currentPort = port
 
-	if config.AudioMode == "usb" {
+	if configSnapshot().AudioMode == "usb" {
 		_, err := CallAudioCtrlAction("set_audio_mode", map[string]interface{}{"audio_mode": "usb", "rtp_port": port})
 		if err != nil {
 			audioLogger.Error().Err(err).Msg("failed to set audio mode")
@@ -134,7 +134,7 @@ func handleAudioClient(conn net.Conn) {
 			return
 		}
 
-		if currentSession != nil {
+		if session := currentSession.Load(); session != nil {
 			if err := packet.Unmarshal(inboundPacket[:n]); err != nil {
 				audioLogger.Warn().Err(err).Msg("error unmarshalling audio socket packet")
 				continue
@@ -148,7 +148,7 @@ func handleAudioClient(conn net.Conn) {
 				continue
 			}
 
-			if _, err := currentSession.AudioTrack.Write(buf); err != nil {
+			if _, err := session.AudioTrack.Write(buf); err != nil {
 				audioLogger.Warn().Err(err).Msg("error writing sample")
 			}
 		}

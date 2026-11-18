@@ -143,12 +143,13 @@ func storeDisplayRotation(degrees int) {
 	displaySettingsMu.Lock()
 	defer displaySettingsMu.Unlock()
 
-	if config.DisplayRotation == rotation {
+	if configSnapshot().DisplayRotation == rotation {
 		return
 	}
 
-	config.DisplayRotation = rotation
-	SaveConfig()
+	updateConfig(func(next *Config) {
+		next.DisplayRotation = rotation
+	})
 	displayLogger.Info().Str("rotation", rotation).Msg("display rotated on the touchscreen")
 }
 
@@ -162,7 +163,7 @@ func cycleDisplayRotation() {
 
 	next := displayRotationOrder[0]
 	for i, rotation := range displayRotationOrder {
-		if rotation == config.DisplayRotation {
+		if rotation == configSnapshot().DisplayRotation {
 			next = displayRotationOrder[(i+1)%len(displayRotationOrder)]
 			break
 		}
@@ -173,8 +174,9 @@ func cycleDisplayRotation() {
 		return
 	}
 
-	config.DisplayRotation = next
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(cfg *Config) {
+		cfg.DisplayRotation = next
+	}); err != nil {
 		displayLogger.Warn().Err(err).Msg("failed to save display rotation")
 	}
 	displayLogger.Info().Str("rotation", next).Msg("display rotated from touchscreen")
@@ -207,13 +209,14 @@ func toggleDisplayPower() bool {
 // notifyDisplayState tells the web UI whether the panel is lit, so a one click
 // display off button does not go out of sync with the touchscreen.
 func notifyDisplayState(on bool) {
-	if currentSession == nil {
+	session := currentSession.Load()
+	if session == nil {
 		return
 	}
 
 	writeJSONRPCEvent("displayState", map[string]interface{}{
 		"on": on,
-	}, currentSession)
+	}, session)
 }
 
 // displayBacklightPercent converts a hardware brightness level to slider percent.
@@ -260,7 +263,7 @@ func pushBacklightToDisplay(percent int) {
 func notifyBacklightChanged(percent int) {
 	writeJSONRPCEvent("backlightChanged", map[string]interface{}{
 		"max_brightness": percent,
-	}, currentSession)
+	}, currentSession.Load())
 }
 
 // actionFailureTiles maps the one shot actions to the touchscreen tile that
@@ -302,7 +305,7 @@ func setTileColor(obj, color string) {
 // displayConfiguredBrightnessLevel converts the configured percentage to the raw
 // level the backlight class expects.
 func displayConfiguredBrightnessLevel() int {
-	return displayBacklightLevel(config.DisplayBrightnessPercent)
+	return displayBacklightLevel(configSnapshot().DisplayBrightnessPercent)
 }
 
 // applyBacklightPercent applies a backlight change requested from the touchscreen
@@ -316,8 +319,9 @@ func applyBacklightPercent(percent int) {
 	}
 
 	displaySettingsMu.Lock()
-	config.DisplayBrightnessPercent = percent
-	if err := SaveConfig(); err != nil {
+	if err := updateConfig(func(next *Config) {
+		next.DisplayBrightnessPercent = percent
+	}); err != nil {
 		displayLogger.Warn().Err(err).Msg("failed to save backlight setting")
 	}
 	displaySettingsMu.Unlock()

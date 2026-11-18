@@ -52,7 +52,7 @@ export function Dialog({ onClose }: { onClose: () => void }) {
   const {
     modalView,
     setModalView,
-    setLocalFile,
+    setBrowserMedia,
     setRemoteVirtualMediaState,
     errorMessage,
     setErrorMessage,
@@ -62,7 +62,7 @@ export function Dialog({ onClose }: { onClose: () => void }) {
   const [incompleteFileName, setIncompleteFileName] = useState<string | null>(null);
   const [mountInProgress, setMountInProgress] = useState(false);
   function clearMountMediaState() {
-    setLocalFile(null);
+    setBrowserMedia(null);
     setRemoteVirtualMediaState(null);
   }
 
@@ -74,7 +74,7 @@ export function Dialog({ onClose }: { onClose: () => void }) {
           reject(new Error(resp.error.message));
         } else {
           setRemoteVirtualMediaState(
-            resp as unknown as MountMediaState["remoteVirtualMediaState"],
+            resp.result as MountMediaState["remoteVirtualMediaState"],
           );
           resolve(null);
         }
@@ -91,8 +91,12 @@ export function Dialog({ onClose }: { onClose: () => void }) {
     console.log(`Mounting ${url} as ${mode}`);
 
     setMountInProgress(true);
-    send("mountWithHTTP", { url, mode }, async resp => {
-      if ("error" in resp) triggerError(resp.error.message);
+    send("mountWithHTTP", { url, mode }, resp => {
+      if ("error" in resp) {
+        triggerError(resp.error.message);
+        setMountInProgress(false);
+        return;
+      }
 
       clearMountMediaState();
       syncRemoteVirtualMediaState()
@@ -106,96 +110,55 @@ export function Dialog({ onClose }: { onClose: () => void }) {
     });
   }
 
-  function handleStorageMount(fileName: string, mode: RemoteVirtualMediaState["mode"]) {
-    console.log(`Mounting ${fileName} as ${mode}`);
-
+  function handleStorageMount(fileName: string, mode: RemoteVirtualMediaState["mode"],
+    method: "mountWithStorage" | "mountWithSDStorage" = "mountWithStorage") {
     if (!fileName.endsWith(".iso") && !fileName.endsWith(".img")) {
       triggerError("Only ISO and IMG files are supported");
       return;
     }
 
     setMountInProgress(true);
-    send("mountWithStorage", { filename: fileName, mode }, async resp => {
-      if ("error" in resp) triggerError(resp.error.message);
+    send(method, { filename: fileName, mode }, resp => {
+      if ("error" in resp) {
+        triggerError(resp.error.data || resp.error.message);
+        setMountInProgress(false);
+        return;
+      }
 
       clearMountMediaState();
       syncRemoteVirtualMediaState()
-        .then(() => {
-          navigate("..");
-        })
-        .catch(err => {
-          triggerError(err instanceof Error ? err.message : String(err));
-        })
-        .finally(() => {
-          // We do this because the mounting is too fast and the UI gets choppy
-          // and the modal exit animation for like 500ms
-          setTimeout(() => {
-            setMountInProgress(false);
-          }, 500);
-        });
+        .then(() => navigate(".."))
+        .catch(err => triggerError(err instanceof Error ? err.message : String(err)))
+        .finally(() => setTimeout(() => setMountInProgress(false), 500));
     });
-
-    clearMountMediaState();
   }
 
   function handleSDStorageMount(fileName: string, mode: RemoteVirtualMediaState["mode"]) {
-    console.log(`Mounting ${fileName} as ${mode}`);
-
-    if (!fileName.endsWith(".iso") && !fileName.endsWith(".img")) {
-      triggerError("Only ISO and IMG files are supported");
-      return;
-    }
- 
-    setMountInProgress(true);
-    send("mountWithSDStorage", { filename: fileName, mode }, async resp => {
-      if ("error" in resp) triggerError(resp.error.message);
-
-      clearMountMediaState();
-      syncRemoteVirtualMediaState()
-        .then(() => {
-          navigate("..");
-        })
-        .catch(err => {
-          triggerError(err instanceof Error ? err.message : String(err));
-        })
-        .finally(() => {
-          // We do this because the mounting is too fast and the UI gets choppy
-          // and the modal exit animation for like 500ms
-          setTimeout(() => {
-            setMountInProgress(false);
-          }, 500);
-        });
-    });
-
-    clearMountMediaState();
+    handleStorageMount(fileName, mode, "mountWithSDStorage");
   }
-  
+
   function handleBrowserMount(file: File, mode: RemoteVirtualMediaState["mode"]) {
     console.log(`Mounting ${file.name} as ${mode}`);
 
+    const generation = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+      byte => byte.toString(16).padStart(2, "0")).join("");
+    const media = { file, generation };
+    const previous = useMountMediaStore.getState().browserMedia;
+    // Publish the file before the RPC: the USB host can read as soon as the LUN attaches.
+    setBrowserMedia(media);
     setMountInProgress(true);
-    send(
-      "mountWithWebRTC",
-      { filename: file.name, size: file.size, mode },
-      async resp => {
-        if ("error" in resp) triggerError(resp.error.message);
-
-        clearMountMediaState();
-        syncRemoteVirtualMediaState()
-          .then(() => {
-            // We need to keep the local file in the store so that the browser can
-            // continue to stream the file to the device
-            setLocalFile(file);
-            navigate("..");
-          })
-          .catch(err => {
-            triggerError(err instanceof Error ? err.message : String(err));
-          })
-          .finally(() => {
-            setMountInProgress(false);
-          });
-      },
-    );
+    send("mountWithWebRTC", { filename: file.name, size: file.size, mode, generation }, resp => {
+      if ("error" in resp) {
+        if (useMountMediaStore.getState().browserMedia === media) setBrowserMedia(previous);
+        triggerError(resp.error.data || resp.error.message);
+        setMountInProgress(false);
+        return;
+      }
+      syncRemoteVirtualMediaState()
+        .then(() => navigate(".."))
+        .catch(err => triggerError(err instanceof Error ? err.message : String(err)))
+        .finally(() => setMountInProgress(false));
+    });
   }
 
   const [selectedMode, setSelectedMode] = useState<"browser" | "url" | "device" | "sd">("device");

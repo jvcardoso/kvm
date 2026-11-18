@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"kvm/internal/network"
 	"kvm/internal/timesync"
@@ -42,12 +43,16 @@ func applyProxyEnvironment(networkConfig *network.NetworkConfig) {
 }
 
 func networkStateChanged() {
+	refreshNetworkState(configSnapshot().NetworkConfig)
+}
+
+func refreshNetworkState(cfg *network.NetworkConfig) {
 	// do not block the main thread
 	go waitCtrlAndRequestDisplayUpdate(true)
 
 	// always restart mDNS when the network state changes
 	if mDNS != nil {
-		_ = mDNS.SetListenOptions(config.NetworkConfig.GetMDNSMode())
+		_ = mDNS.SetListenOptions(cfg.GetMDNSMode())
 		_ = mDNS.SetLocalNames([]string{
 			networkState.GetHostname(),
 			networkState.GetFQDN(),
@@ -57,12 +62,21 @@ func networkStateChanged() {
 
 func initNetwork() error {
 	ensureConfigLoaded()
-	applyProxyEnvironment(config.NetworkConfig)
+	configured := *configSnapshot().NetworkConfig
+	if configured.IPv4Static != nil {
+		settings := *configured.IPv4Static
+		configured.IPv4Static = &settings
+	}
+	if configured.IPv6Static != nil {
+		settings := *configured.IPv6Static
+		configured.IPv6Static = &settings
+	}
+	applyProxyEnvironment(&configured)
 
 	state, err := network.NewNetworkInterfaceState(&network.NetworkInterfaceOptions{
 		DefaultHostname: GetDefaultHostname(),
 		InterfaceName:   NetIfName,
-		NetworkConfig:   config.NetworkConfig,
+		NetworkConfig:   &configured,
 		Logger:          networkLogger,
 		OnStateChange: func(state *network.NetworkInterfaceState) {
 			networkStateChanged()
@@ -73,17 +87,14 @@ func initNetwork() error {
 		OnDhcpLeaseChange: func(lease *udhcpc.Lease) {
 			networkStateChanged()
 
-			if currentSession == nil {
+			session := currentSession.Load()
+			if session == nil {
 				return
 			}
 
-			writeJSONRPCEvent("networkState", networkState.RpcGetNetworkState(), currentSession)
+			writeJSONRPCEvent("networkState", networkState.RpcGetNetworkState(), session)
 		},
-		OnConfigChange: func(networkConfig *network.NetworkConfig) {
-			config.NetworkConfig = networkConfig
-			config.AppliedNetworkConfig = networkConfig
-			networkStateChanged()
-		},
+		OnConfigChange: refreshNetworkState,
 	})
 
 	if state == nil {
@@ -99,20 +110,12 @@ func initNetwork() error {
 
 	networkState = state
 
-	if config != nil && config.NetworkConfig != nil {
-		if config.NetworkConfig.PendingReboot.Valid && config.NetworkConfig.PendingReboot.Bool {
-			if config.AppliedNetworkConfig != nil && network.IsSame(config.AppliedNetworkConfig, *config.NetworkConfig) {
-				config.NetworkConfig.PendingReboot = null.BoolFrom(false)
-				_ = SaveConfig()
-			}
-		}
-	}
-
-	if config != nil && config.NetworkConfig != nil {
-		if config.NetworkConfig.PendingReboot.Valid && config.NetworkConfig.PendingReboot.Bool {
-			config.NetworkConfig.PendingReboot = null.BoolFrom(false)
-			_ = SaveConfig()
-		}
+	if cfg := configSnapshot().NetworkConfig; cfg != nil && cfg.PendingReboot.Bool {
+		_ = updateConfig(func(next *Config) {
+			cfg := *next.NetworkConfig
+			cfg.PendingReboot = null.BoolFrom(false)
+			next.NetworkConfig = &cfg
+		})
 	}
 
 	return nil
@@ -129,7 +132,12 @@ func rpcGetNetworkSettings() network.RpcNetworkSettings {
 	return rpcSettings
 }
 
+var networkSettingsMutex sync.Mutex
+
 func rpcSetNetworkSettings(settings network.RpcNetworkSettings) (*network.RpcNetworkSettings, error) {
+	networkSettingsMutex.Lock()
+	defer networkSettingsMutex.Unlock()
+
 	current := networkState.RpcGetNetworkSettings()
 	changedCore := !network.IsSame(current.NetworkConfig, settings.NetworkConfig)
 	if changedCore {
@@ -141,29 +149,36 @@ func rpcSetNetworkSettings(settings network.RpcNetworkSettings) (*network.RpcNet
 		return nil, s
 	}
 	applied := networkState.RpcGetNetworkSettings()
-	config.NetworkConfig = &applied.NetworkConfig
-	// If we just reverted to the same core config as applied, clear pending_reboot
-	if config.AppliedNetworkConfig != nil {
-		// create copies ignoring PendingReboot
-		a := *config.AppliedNetworkConfig
-		b := applied.NetworkConfig
-		a.PendingReboot = null.Bool{}
-		b.PendingReboot = null.Bool{}
-		if network.IsSame(a, b) {
-			config.NetworkConfig.PendingReboot = null.BoolFrom(false)
+	before, after := current.NetworkConfig, applied.NetworkConfig
+	before.PendingReboot, after.PendingReboot = null.Bool{}, null.Bool{}
+	if err := updateConfig(func(next *Config) {
+		next.NetworkConfig = &applied.NetworkConfig
+		if !network.IsSame(before, after) {
+			appliedCopy := applied.NetworkConfig
+			next.AppliedNetworkConfig = &appliedCopy
 		}
-	}
-	if err := SaveConfig(); err != nil {
+		// If we just reverted to the same core config as applied, clear pending_reboot.
+		if next.AppliedNetworkConfig != nil {
+			// create copies ignoring PendingReboot
+			a := *next.AppliedNetworkConfig
+			b := applied.NetworkConfig
+			a.PendingReboot = null.Bool{}
+			b.PendingReboot = null.Bool{}
+			if network.IsSame(a, b) {
+				applied.NetworkConfig.PendingReboot = null.BoolFrom(false)
+			}
+		}
+	}); err != nil {
 		return nil, err
 	}
-	applyProxyEnvironment(config.NetworkConfig)
+	applyProxyEnvironment(&applied.NetworkConfig)
 
 	// refresh time sync server lists so custom servers take effect immediately
 	if timeSync != nil {
-		timeSync.SetNetworkConfig(config.NetworkConfig)
+		timeSync.SetNetworkConfig(&applied.NetworkConfig)
 	}
 
-	return &network.RpcNetworkSettings{NetworkConfig: *config.NetworkConfig}, nil
+	return &network.RpcNetworkSettings{NetworkConfig: applied.NetworkConfig}, nil
 }
 
 func rpcGetTimeSyncServers() map[string]interface{} {

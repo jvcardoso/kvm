@@ -649,8 +649,8 @@ export interface RemoteVirtualMediaState {
 }
 
 export interface MountMediaState {
-  localFile: File | null;
-  setLocalFile: (file: MountMediaState["localFile"]) => void;
+  browserMedia: { file: File; generation: string } | null;
+  setBrowserMedia: (media: MountMediaState["browserMedia"]) => void;
 
   remoteVirtualMediaState: RemoteVirtualMediaState | null;
   setRemoteVirtualMediaState: (state: MountMediaState["remoteVirtualMediaState"]) => void;
@@ -669,8 +669,8 @@ export interface MountMediaState {
 }
 
 export const useMountMediaStore = create<MountMediaState>(set => ({
-  localFile: null,
-  setLocalFile: file => set({ localFile: file }),
+  browserMedia: null,
+  setBrowserMedia: media => set({ browserMedia: media }),
 
   remoteVirtualMediaState: null,
   setRemoteVirtualMediaState: state => set({ remoteVirtualMediaState: state }),
@@ -875,7 +875,7 @@ export const useHidStore = create<HidState>((set, get) => ({
     if (!enabled) suppressKeyboardTap();
     set({ isVirtualKeyboardEnabled: enabled });
   },
-  allowTapToOpenVirtualKeyboard: readStoredBoolean(TAP_KEYBOARD_STORAGE_KEY, true),
+  allowTapToOpenVirtualKeyboard: readStoredBoolean(TAP_KEYBOARD_STORAGE_KEY, false),
   setAllowTapToOpenVirtualKeyboard: enabled => {
     writeStoredBoolean(TAP_KEYBOARD_STORAGE_KEY, enabled);
     set({ allowTapToOpenVirtualKeyboard: enabled });

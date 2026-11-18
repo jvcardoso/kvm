@@ -52,7 +52,7 @@ func initCertStore() {
 }
 
 func getCertificate(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	switch config.TLSMode {
+	switch configSnapshot().TLSMode {
 	case "self-signed":
 		if isTimeSyncNeeded() || !timeSync.IsSyncSuccess() {
 			return nil, fmt.Errorf("time is not synced")
@@ -68,7 +68,7 @@ func getCertificate(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
 
 func getTLSState() TLSState {
 	s := TLSState{}
-	switch config.TLSMode {
+	switch configSnapshot().TLSMode {
 	case "disabled":
 		s.Mode = "disabled"
 	case "custom":
@@ -96,52 +96,36 @@ func getTLSState() TLSState {
 	return s
 }
 
-func setTLSState(s TLSState) error {
-	var isChanged = false
+var tlsSettingsMutex sync.Mutex
 
-	switch s.Mode {
+func setTLSState(s TLSState) error {
+	tlsSettingsMutex.Lock()
+	defer tlsSettingsMutex.Unlock()
+
+	mode := s.Mode
+	switch mode {
 	case "disabled":
-		if config.TLSMode != "" {
-			isChanged = true
-		}
-		config.TLSMode = ""
+		mode = ""
 	case "custom":
-		if config.TLSMode == "" {
-			isChanged = true
-		}
-		// parse pem to cert and key
-		err, _ := certStore.ValidateAndSaveCertificate(webSecureCustomCertificateName, s.Certificate, s.PrivateKey, true)
-		// warn doesn't matter as ... we don't know the hostname yet
-		if err != nil {
+		if err, _ := certStore.ValidateAndSaveCertificate(webSecureCustomCertificateName, s.Certificate, s.PrivateKey, true); err != nil {
 			return fmt.Errorf("failed to save certificate: %w", err)
 		}
-		config.TLSMode = "custom"
 	case "self-signed":
-		if config.TLSMode == "" {
-			isChanged = true
-		}
-		config.TLSMode = "self-signed"
 	default:
-		return fmt.Errorf("invalid TLS mode: %s", s.Mode)
+		return fmt.Errorf("invalid TLS mode: %s", mode)
 	}
 
-	if !isChanged {
-		websecureLogger.Info().Msg("TLS enabled state is not changed, not starting/stopping websecure server")
-		return nil
-	}
-
-	if err := SaveConfig(); err != nil {
+	wasEnabled := configSnapshot().TLSMode != ""
+	if err := updateConfig(func(next *Config) { next.TLSMode = mode }); err != nil {
 		return fmt.Errorf("failed to save TLS config: %w", err)
 	}
-
-	if config.TLSMode == "" {
-		websecureLogger.Info().Msg("Stopping websecure server, as TLS mode is disabled")
-		stopWebSecureServer()
-	} else {
-		websecureLogger.Info().Msg("Starting websecure server, as TLS mode is enabled")
-		startWebSecureServer()
+	if enabled := mode != ""; enabled != wasEnabled {
+		if enabled {
+			startWebSecureServer()
+		} else {
+			stopWebSecureServer()
+		}
 	}
-
 	return nil
 }
 

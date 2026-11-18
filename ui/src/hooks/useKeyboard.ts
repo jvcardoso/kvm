@@ -131,22 +131,26 @@ export default function useKeyboard() {
   });
 
   const sendKeyboardEvent = useCallback(
-    (keys: number[], modifiers: number[], forceRelease = false) => {
-      if (!forceHttp && rpcDataChannel?.readyState !== "open") return;
+    (keys: number[], modifiers: number[], forceRelease = false, onComplete?: (error?: Error) => void) => {
+      const unavailable = () => {
+        onComplete?.(new Error("Keyboard input is unavailable"));
+        return false;
+      };
+      if (!forceHttp && rpcDataChannel?.readyState !== "open") return unavailable();
       // Don't send keyboard events while reinitializing gadget
-      if (isReinitializingGadget) return;
+      if (isReinitializingGadget) return unavailable();
       // The keyboard interface is switched off, so /dev/hidg0 does not exist
       // either. Nothing can reach the host, and a forced release is pointless
       // when the interface itself is gone: each attempt only logs a write
       // failure and, via the device-side missing-HID watchdog, can drag the
       // gadget into a rebuild loop. Drop everything, releases included.
-      if (!keyboardEnabled) return;
+      if (!keyboardEnabled) return unavailable();
       // A release must never be dropped *while the interface still exists*. If
       // the report that pressed a key goes out and the matching empty report is
       // swallowed here, the host keeps the key latched and auto-repeats it
       // forever. Losing a release is far worse than sending one while the
       // gadget is momentarily not configured.
-      if (!forceRelease && usbState !== "configured") return;
+      if (!forceRelease && usbState !== "configured") return unavailable();
       // Bitwise OR, not addition: the modifier byte is a bitmask, so adding
       // duplicate values would corrupt it.
       let accModifier = modifiers.reduce((acc, val) => acc | val, 0);
@@ -159,7 +163,8 @@ export default function useKeyboard() {
       // No keepalive is needed here: full-state reports never arm the device-side
       // auto-release timers, those only exist for the per-key keypressReport path.
       if (rpcHidReady) {
-        reportKeyboardEvent(keys, accModifier);
+        if (!reportKeyboardEvent(keys, accModifier)) return unavailable();
+        onComplete?.();
       } else {
         // Fallback to JSON-RPC
         send("keyboardReport", { keys, modifier: accModifier }, resp => {
@@ -168,12 +173,16 @@ export default function useKeyboard() {
             if (msg.includes("cannot send after transport endpoint shutdown") && usbState === "configured") {
               notifications.error("Please check if the cable and connection are stable.", { duration: 5000 });
             }
+            onComplete?.(new Error(msg || "Keyboard report failed"));
+          } else {
+            onComplete?.();
           }
         });
       }
 
       // We do this for the info bar to display the currently pressed keys for the user
       updateActiveKeysAndModifiers({ keys: keys, modifiers: modifiers });
+      return true;
     },
     [forceHttp, rpcDataChannel?.readyState, rpcHidReady, reportKeyboardEvent, send, updateActiveKeysAndModifiers, isReinitializingGadget, usbState, keyboardEnabled, swapCommandControl],
   );

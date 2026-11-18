@@ -40,6 +40,8 @@ export default function KeyboardSide() {
   const keyboardLedSync = useSettingsStore(state => state.keyboardLedSync);
   const setKeyboardLedSync = useSettingsStore(state => state.setKeyboardLedSync);
   const resetKeyboardLedTruth = useHidStore(state => state.resetKeyboardLedTruth);
+  const allowTapKeyboard = useHidStore(state => state.allowTapToOpenVirtualKeyboard);
+  const setAllowTapKeyboard = useHidStore(state => state.setAllowTapToOpenVirtualKeyboard);
 
   // The stored value may be spelled with a dash or an underscore, so resolve it
   // first; otherwise the dropdown would silently show the first option.
@@ -168,6 +170,17 @@ export default function KeyboardSide() {
             onChange={value => onKeyboardFormFactorChange(value)}
           />
         </SettingsItem>
+
+        {isMobile && (
+          <SettingsItem
+            title={$at("Tap video to open keyboard")}
+            description={$at("Keep disabled to use taps only for the mouse")}
+            noCol
+            className="flex-row items-center"
+          >
+            <Checkbox checked={allowTapKeyboard} onChange={e => setAllowTapKeyboard(e.target.checked)} />
+          </SettingsItem>
+        )}
 
         <SettingsItem
           title={$at("Show Pressed Keys")}

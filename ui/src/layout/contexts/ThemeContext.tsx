@@ -17,7 +17,9 @@ const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
 
 export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
-    return (localStorage.getItem('theme') as ThemeMode) || 'light';
+    const saved = localStorage.getItem('theme');
+    if (saved === 'light' || saved === 'dark') return saved;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
   });
 
   const isDark = themeMode === 'dark';
@@ -146,6 +148,10 @@ export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
   useEffect(() => {
     localStorage.setItem('theme', themeMode);
+    // Keep Tailwind's dark styles in sync with the component/Ant Design theme.
+    // Otherwise a first visit can render white icons on a white toolbar.
+    document.documentElement.classList.toggle('dark', isDark);
+    document.documentElement.classList.toggle('light', !isDark);
     document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
   }, [themeMode, isDark]);
 

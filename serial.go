@@ -46,7 +46,7 @@ var serialReader = &serialPump{subs: map[int]chan []byte{}}
 func initSerialPort() {
 	go serialReader.run()
 
-	if serialPortEnabled {
+	if serialPortEnabled.Load() {
 		if err := reopenSerialPort(); err != nil {
 			serialLogger.Error().Err(err).Msg("Failed to restore serial port connection")
 		}
@@ -67,12 +67,13 @@ func closeSerialPort() {
 func reopenSerialPort() error {
 	serialReader.closePort()
 
-	p, err := serial.Open(serialPortPath, serialPortMode)
+	mode := serialModeSnapshot()
+	p, err := serial.Open(serialPortPath, mode)
 	if err != nil {
 		serialLogger.Error().
 			Err(err).
 			Str("path", serialPortPath).
-			Interface("mode", serialPortMode).
+			Interface("mode", mode).
 			Msg("Error opening serial port")
 		return err
 	}
@@ -83,7 +84,7 @@ func reopenSerialPort() error {
 
 	serialLogger.Info().
 		Str("path", serialPortPath).
-		Interface("mode", serialPortMode).
+		Interface("mode", mode).
 		Msg("Serial port opened successfully")
 	return nil
 }
@@ -298,6 +299,11 @@ func handleSerialChannel(d *webrtc.DataChannel) {
 }
 
 func handleSerialWS(c *gin.Context) {
+	if !isAllowedWebSocketOrigin(c.Request) {
+		c.JSON(403, gin.H{"error": "cross-origin websocket request rejected"})
+		return
+	}
+
 	source := c.ClientIP()
 	scopedLogger := serialLogger.With().
 		Str("transport", "websocket").

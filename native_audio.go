@@ -18,25 +18,39 @@ var (
 
 var audioSocketConn net.Conn
 
-var audioOngoingRequests = make(map[int32]chan *CtrlResponse)
+var (
+	audioOngoingRequests     = make(map[int32]chan *CtrlResponse)
+	audioOngoingRequestsLock = &sync.Mutex{}
+	audioConnWriteLock       = make(nativeControlLock, 1)
+)
 
-var audioLock = &sync.Mutex{}
+var audioActionGate = make(chan struct{}, 1)
+
+const audioCtrlTimeout = 5 * time.Second
 
 func CallAudioCtrlAction(action string, params map[string]interface{}) (*CtrlResponse, error) {
-	audioLock.Lock()
-	defer audioLock.Unlock()
+	deadline := time.Now().Add(audioCtrlTimeout)
+	release, err := acquireNativeAction(audioActionGate, deadline)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	responseChan := make(chan *CtrlResponse, 1)
+	ctrlSeq := nextSeq()
+	audioOngoingRequestsLock.Lock()
+	audioOngoingRequests[ctrlSeq] = responseChan
+	audioOngoingRequestsLock.Unlock()
+
 	ctrlAction := CtrlAction{
 		Action: action,
-		Seq:    nextSeq(),
+		Seq:    ctrlSeq,
 		Params: params,
 	}
 
-	responseChan := make(chan *CtrlResponse, 1)
-	audioOngoingRequests[ctrlAction.Seq] = responseChan
-
 	jsonData, err := json.Marshal(ctrlAction)
 	if err != nil {
-		delete(audioOngoingRequests, ctrlAction.Seq)
+		dropAudioResponseChan(ctrlSeq)
 		return nil, fmt.Errorf("error marshaling ctrl action: %w", err)
 	}
 
@@ -46,15 +60,17 @@ func CallAudioCtrlAction(action string, params map[string]interface{}) (*CtrlRes
 
 	scopedLogger.Debug().Msg("sending audio ctrl action")
 
-	err = WriteAudioCtrlMessage(jsonData)
+	err = writeAudioCtrlMessageUntil(jsonData, deadline)
 	if err != nil {
-		delete(audioOngoingRequests, ctrlAction.Seq)
-		return nil, ErrorfL(&scopedLogger, "error writing audio ctrl message", err)
+		dropAudioResponseChan(ctrlSeq)
+		return nil, fmt.Errorf("writing native control message: %w", err)
 	}
 
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case response := <-responseChan:
-		delete(audioOngoingRequests, ctrlAction.Seq)
+		dropAudioResponseChan(ctrlSeq)
 		if response.Error != "" {
 			return nil, ErrorfL(
 				&scopedLogger,
@@ -63,18 +79,44 @@ func CallAudioCtrlAction(action string, params map[string]interface{}) (*CtrlRes
 			)
 		}
 		return response, nil
-	case <-time.After(5 * time.Second):
-		delete(audioOngoingRequests, ctrlAction.Seq)
-		return nil, ErrorfL(&scopedLogger, "timeout waiting for response", nil)
+	case <-timer.C:
+		dropAudioResponseChan(ctrlSeq)
+		return nil, fmt.Errorf("waiting for native response: %w", os.ErrDeadlineExceeded)
+	}
+}
+
+func dropAudioResponseChan(ctrlSeq int32) {
+	audioOngoingRequestsLock.Lock()
+	delete(audioOngoingRequests, ctrlSeq)
+	audioOngoingRequestsLock.Unlock()
+}
+
+func deliverAudioResponse(ctrlSeq int32, response *CtrlResponse) {
+	audioOngoingRequestsLock.Lock()
+	defer audioOngoingRequestsLock.Unlock()
+
+	responseChan, ok := audioOngoingRequests[ctrlSeq]
+	if !ok {
+		return
+	}
+
+	select {
+	case responseChan <- response:
+	default:
 	}
 }
 
 func WriteAudioCtrlMessage(message []byte) error {
-	if audioSocketConn == nil {
-		return fmt.Errorf("audio socket not connected")
+	return writeAudioCtrlMessageUntil(message, time.Now().Add(audioCtrlTimeout))
+}
+
+func writeAudioCtrlMessageUntil(message []byte, deadline time.Time) error {
+	release, err := acquireNativeAction(audioConnWriteLock, deadline)
+	if err != nil {
+		return err
 	}
-	_, err := audioSocketConn.Write(message)
-	return err
+	defer release()
+	return writeNativeControl(audioSocketConn, message, deadline)
 }
 
 var audioCtrlSocketListener net.Listener
@@ -147,12 +189,13 @@ func handleAudioCtrlClient(conn net.Conn) {
 		Logger()
 
 	scopedLogger.Info().Msg("audio socket client connected")
+	audioConnWriteLock.Lock()
 	if audioSocketConn != nil {
 		scopedLogger.Debug().Msg("closing existing audio socket connection")
 		audioSocketConn.Close()
 	}
-
 	audioSocketConn = conn
+	audioConnWriteLock.Unlock()
 
 	readBuf := make([]byte, 4096)
 	for {
@@ -172,10 +215,8 @@ func handleAudioCtrlClient(conn net.Conn) {
 		scopedLogger.Trace().Interface("data", audioResp).Msg("audio sock msg")
 
 		if audioResp.Seq != 0 {
-			responseChan, ok := audioOngoingRequests[audioResp.Seq]
-			if ok {
-				responseChan <- &audioResp
-			}
+			response := audioResp
+			deliverAudioResponse(response.Seq, &response)
 		}
 		switch audioResp.Event {
 		case "audio_input_state":

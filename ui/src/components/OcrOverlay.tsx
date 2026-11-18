@@ -41,50 +41,67 @@ async function loadTesseract() {
   return createWorker;
 }
 
-let workerPromise: Promise<TesseractWorker> | null = null;
+let worker: TesseractWorker | null = null;
+let workerQueue = Promise.resolve();
+let workerLang: string | null = null;
 let cleanupTimer: ReturnType<typeof setTimeout> | null = null;
 
-async function initWorker() {
+function resolveTesseractLang(uiLang?: string): string {
+  if (uiLang === "zh") return "eng+chi_sim";
+  if (uiLang === "pt") return "eng+por";
+  return "eng";
+}
+
+async function initWorker(lang: string) {
   const createWorker = await loadTesseract();
-  return createWorker("eng", 1) as Promise<TesseractWorker>;
+  return createWorker(lang, 1) as Promise<TesseractWorker>;
 }
 
 async function terminateWorker() {
-  if (!workerPromise) return;
+  const previous = worker;
+  worker = null;
+  workerLang = null;
   try {
-    const worker = await workerPromise;
-    await worker.terminate();
+    await previous?.terminate();
   } catch {
-    // Ignore termination errors.
+    // The next recognition will create a fresh worker.
   }
-  workerPromise = null;
 }
 
-function getWorker() {
-  if (cleanupTimer) {
+function recognize(canvas: HTMLCanvasElement) {
+  if (cleanupTimer !== null) {
     clearTimeout(cleanupTimer);
     cleanupTimer = null;
   }
 
-  if (!workerPromise) {
-    workerPromise = initWorker().catch(err => {
-      workerPromise = null;
-      throw err;
-    });
-  }
-
-  // Auto-terminate worker after inactivity to reduce memory footprint.
-  cleanupTimer = setTimeout(() => {
-    void terminateWorker();
-    cleanupTimer = null;
-  }, 60_000);
-
-  return workerPromise;
+  const lang = resolveTesseractLang(useSettingsStore.getState().language);
+  const result = workerQueue.then(async () => {
+    if (cleanupTimer !== null) {
+      clearTimeout(cleanupTimer);
+      cleanupTimer = null;
+    }
+    if (workerLang !== lang) await terminateWorker();
+    try {
+      if (!worker) {
+        worker = await initWorker(lang);
+        workerLang = lang;
+      }
+      return await worker.recognize(canvas, {}, { text: true, blocks: true });
+    } finally {
+      if (worker) {
+        cleanupTimer = setTimeout(() => {
+          cleanupTimer = null;
+          workerQueue = workerQueue.then(terminateWorker);
+        }, 60_000);
+      }
+    }
+  });
+  workerQueue = result.then(() => {}, () => {});
+  return result;
 }
 
 async function performOcr(canvas: HTMLCanvasElement): Promise<string> {
-  const worker = await getWorker();
-  const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true });
+  const { data } = await recognize(canvas);
   const lines = data.blocks?.flatMap(b => b.paragraphs.flatMap(p => p.lines)) ?? [];
 
   if (lines.length === 0) return (data.text || "").trim();

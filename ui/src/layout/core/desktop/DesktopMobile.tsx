@@ -67,6 +67,8 @@ export default function MobileDesktop({ isFullscreen }: { isFullscreen?: number 
   // That report lives in useMouseEvents, which needs this hook's result first, so
   // the two are joined through a ref instead of each depending on the other.
   const touchScrollRef = useRef<(wheelY: number, wheelX: number) => void>(() => {});
+  const touchCancelRef = useRef<() => void>(() => {});
+  const handleMultiTouchStart = useCallback(() => touchCancelRef.current(), []);
   const handleTouchScroll = useCallback((wheelY: number, wheelX: number) => {
     touchScrollRef.current(wheelY, wheelX);
   }, []);
@@ -75,6 +77,7 @@ export default function MobileDesktop({ isFullscreen }: { isFullscreen?: number 
     zoomContainerRef as React.RefObject<HTMLDivElement>,
     isTouchGestureEnabled,
     handleTouchScroll,
+    handleMultiTouchStart,
   );
   const { handleGlobalPaste } = usePasteHandler(pasteCaptureRef as React.RefObject<HTMLTextAreaElement>);
   const keyboardEvents = useKeyboardEvents(pasteCaptureRef as React.RefObject<HTMLTextAreaElement>, isReinitializingGadget);
@@ -82,15 +85,16 @@ export default function MobileDesktop({ isFullscreen }: { isFullscreen?: number 
   const mouseEvents = useMouseEvents(videoElm as React.RefObject<HTMLVideoElement>, pointerLock, touchZoom, virtualMouseActive, 0);
   useEffect(() => {
     touchScrollRef.current = mouseEvents.sendWheelReport;
-  }, [mouseEvents.sendWheelReport]);
+    touchCancelRef.current = mouseEvents.cancelTouchGesture;
+  }, [mouseEvents.sendWheelReport, mouseEvents.cancelTouchGesture]);
   const overlays = useVideoOverlays(videoStream, pointerLock, videoEffects);
 
   const forceHttp = useSettingsStore(state => state.forceHttp);
   const setMouseMode = useSettingsStore(state => state.setMouseMode);
   const mouseX = useMouseStore(state => state.mouseX);
   const mouseY = useMouseStore(state => state.mouseY);
-  const allowTapToOpenVirtualKeyboard = useHidStore(state => state.allowTapToOpenVirtualKeyboard);
-  const setAllowTapToOpenVirtualKeyboard = useHidStore(state => state.setAllowTapToOpenVirtualKeyboard);
+  const virtualKeyboardEnabled = useHidStore(state => state.isVirtualKeyboardEnabled);
+  const setVirtualKeyboardEnabled = useHidStore(state => state.setVirtualKeyboardEnabled);
   const activeButtonsRef = useRef(0);
   // Absolute HID coordinates map 0..1 onto the whole screen, so a zero default
   // would fling the host cursor into the top-left corner on the first button
@@ -163,7 +167,7 @@ export default function MobileDesktop({ isFullscreen }: { isFullscreen?: number 
   }, [keyboardEvents.setupKeyboardEvents, videoStream.setupVideoEventListeners, mouseEvents.setupMouseEvents]);
 
   return (
-    <div className=" h-full w-full flex flex-col justify-evenly overflow-hidden  bg-[#d3d3d3] dark:bg-[#1a1a1a]">
+    <div className="h-full min-h-0 w-full flex flex-col overflow-hidden bg-[#d3d3d3] dark:bg-[#1a1a1a]">
       <div></div>
       <StatsTobbar title={""} targetView={"SettingsModal"}> <SettingsModal /></StatsTobbar>
       <StatsTobbar title={"Clipboard"} targetView={"ClipboardMobile"}> <Clipboard /></StatsTobbar>
@@ -254,14 +258,14 @@ export default function MobileDesktop({ isFullscreen }: { isFullscreen?: number 
         <div className="flex h-full flex-col">
           <div className="relative grow h-full w-full overflow-hidden">
             <div className="flex h-full flex-col">
-              <div className="grid grow grid-rows-(--grid-bodyFooter) overflow-hidden h-full w-full">
+              <div className="grid grow grid-rows-[minmax(0,1fr)_auto] overflow-hidden h-full min-h-0 w-full">
                 <PointerLockBar show={overlays.showPointerLockBar} />
 
                 <div
                   className={`relative h-full w-full  flex items-center justify-center overflow-hidden`}>
                   <div
                       ref={zoomContainerRef}
-                      className={cx("relative flex h-full w-full items-center justify-center ", dark_bg_desktop)}
+                      className="relative flex h-full w-full items-center justify-center bg-black"
                       style={{
                           transform: `translate(${touchZoom.mobileTx}px, ${touchZoom.mobileTy}px) scale(${touchZoom.mobileScale})`,
                           transformOrigin: "center center",
@@ -273,7 +277,7 @@ export default function MobileDesktop({ isFullscreen }: { isFullscreen?: number 
                         onPlaying={videoStream.onVideoPlaying}
                         style={videoEffects.videoStyle}
                         className={cx(
-                          `h-full  w-full  ${dark_bg_style_fun(isDark)} object-contain transition-all duration-1000`,
+                          "h-full w-full bg-black object-contain transition-all duration-1000",
                           {
                             "cursor-none": videoEffects.settings.isCursorHidden,
                             "pointer-events-none": isOcrMode,
@@ -314,8 +318,8 @@ export default function MobileDesktop({ isFullscreen }: { isFullscreen?: number 
                       isTouchGestureEnabled={isTouchGestureEnabled}
                       onToggleTouchGesture={() => setIsTouchGestureEnabled(!isTouchGestureEnabled)}
                       onResetView={() => touchZoom.resetTransform()}
-                      virtualKeyboardEnabled={allowTapToOpenVirtualKeyboard}
-                      onToggleVirtualKeyboard={() => setAllowTapToOpenVirtualKeyboard(!allowTapToOpenVirtualKeyboard)}
+                      virtualKeyboardEnabled={virtualKeyboardEnabled}
+                      onToggleVirtualKeyboard={() => setVirtualKeyboardEnabled(!virtualKeyboardEnabled)}
                       onPressButtons={mask => updateButtons(mask, true)}
                       onReleaseButtons={mask => updateButtons(mask, false)}
                       mouseToolsAllowed={mouseMode === "relative"}

@@ -113,9 +113,11 @@ func switchToScreenIfDifferent(screenName string) {
 }
 
 var (
-	cloudBlinkLock    sync.Mutex = sync.Mutex{}
-	cloudBlinkStopped bool
-	cloudBlinkTicker  *time.Ticker
+	cloudBlinkLock       sync.Mutex = sync.Mutex{}
+	cloudBlinkStopped    bool
+	cloudBlinkTicker     *time.Ticker
+	lastWrittenUsbState  string
+	lastWrittenHdmiState string
 )
 
 func updateDisplay() {
@@ -127,14 +129,21 @@ func updateDisplay() {
 	} else {
 		_, _ = lvObjSetState("Main", "USB_DISCONNECTED")
 	}
-	_ = os.WriteFile("/userdata/usb_state", []byte(usbStateValue), 0644)
+	if usbStateValue != lastWrittenUsbState {
+		_ = os.WriteFile("/userdata/usb_state", []byte(usbStateValue), 0644)
+		lastWrittenUsbState = usbStateValue
+	}
 
-	if lastVideoState.Ready {
+	hdmiStateValue := "disconnected"
+	if video, _ := rpcGetVideoState(); video.Ready {
 		_, _ = lvObjSetState("Main", "HDMI_CONNECTED")
-		_ = os.WriteFile("/userdata/hdmi_state", []byte("connected"), 0644)
+		hdmiStateValue = "connected"
 	} else {
 		_, _ = lvObjSetState("Main", "HDMI_DISCONNECTED")
-		_ = os.WriteFile("/userdata/hdmi_state", []byte("disconnected"), 0644)
+	}
+	if hdmiStateValue != lastWrittenHdmiState {
+		_ = os.WriteFile("/userdata/hdmi_state", []byte(hdmiStateValue), 0644)
+		lastWrittenHdmiState = hdmiStateValue
 	}
 
 	pushMainNetworkState()
@@ -301,7 +310,7 @@ func wakeDisplay(force bool) {
 	}
 
 	// Don't try to wake up if the display is turned off.
-	if config.DisplayBrightnessPercent == 0 {
+	if configSnapshot().DisplayBrightnessPercent == 0 {
 		return
 	}
 
@@ -310,12 +319,12 @@ func wakeDisplay(force bool) {
 		displayLogger.Warn().Err(err).Msg("failed to wake display")
 	}
 
-	if config.DisplayDimAfterSec != 0 {
-		dimTicker.Reset(time.Duration(config.DisplayDimAfterSec) * time.Second)
+	if configSnapshot().DisplayDimAfterSec != 0 {
+		dimTicker.Reset(time.Duration(configSnapshot().DisplayDimAfterSec) * time.Second)
 	}
 
-	if config.DisplayOffAfterSec != 0 {
-		offTicker.Reset(time.Duration(config.DisplayOffAfterSec) * time.Second)
+	if configSnapshot().DisplayOffAfterSec != 0 {
+		offTicker.Reset(time.Duration(configSnapshot().DisplayOffAfterSec) * time.Second)
 	}
 	backlightOffSince.Store(0)
 	backlightState = 0
@@ -362,7 +371,7 @@ func watchTsEvents() {
 func startBacklightTickers() {
 	// Don't start the tickers if the display is switched off.
 	// Set the display to off if that's the case.
-	if config.DisplayBrightnessPercent == 0 {
+	if configSnapshot().DisplayBrightnessPercent == 0 {
 		_ = setDisplayBrightness(0)
 		return
 	}
@@ -376,9 +385,9 @@ func startBacklightTickers() {
 		offTicker.Stop()
 	}
 
-	if config.DisplayDimAfterSec != 0 {
+	if configSnapshot().DisplayDimAfterSec != 0 {
 		displayLogger.Info().Msg("dim_ticker has started")
-		dimTicker = time.NewTicker(time.Duration(config.DisplayDimAfterSec) * time.Second)
+		dimTicker = time.NewTicker(time.Duration(configSnapshot().DisplayDimAfterSec) * time.Second)
 
 		go func() {
 			for { //nolint:staticcheck
@@ -390,9 +399,9 @@ func startBacklightTickers() {
 		}()
 	}
 
-	if config.DisplayOffAfterSec != 0 {
+	if configSnapshot().DisplayOffAfterSec != 0 {
 		displayLogger.Info().Msg("off_ticker has started")
-		offTicker = time.NewTicker(time.Duration(config.DisplayOffAfterSec) * time.Second)
+		offTicker = time.NewTicker(time.Duration(configSnapshot().DisplayOffAfterSec) * time.Second)
 
 		go func() {
 			for { //nolint:staticcheck
@@ -410,8 +419,8 @@ func initDisplay() {
 		waitDisplayCtrlClientConnected()
 		displayLogger.Info().Msg("setting initial display contents")
 		time.Sleep(500 * time.Millisecond)
-		_, _ = lvDispSetRotation(config.DisplayRotation)
-		pushBacklightToDisplay(config.DisplayBrightnessPercent)
+		_, _ = lvDispSetRotation(configSnapshot().DisplayRotation)
+		pushBacklightToDisplay(configSnapshot().DisplayBrightnessPercent)
 		updateStaticContents()
 		initTimeZone()
 		displayInited = true

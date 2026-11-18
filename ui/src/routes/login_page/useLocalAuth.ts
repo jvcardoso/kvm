@@ -8,8 +8,7 @@ import { DEVICE_API } from "@/ui.config";
 import { ThemeMode, useTheme } from "@/layout/contexts/ThemeContext";
 import { useSettingsStore } from "@/hooks/stores";
 
-import enJSON from '../../locales/en.json';
-import zhJSON from '../../locales/zh.json';
+import { getLocaleMessages } from '../../locales';
 
 export const useLocalAuthLogic = () => {
   const { $at } = useReactAt();
@@ -110,12 +109,12 @@ export const useLanguageSettings = () => {
   const setLanguageInStore = useSettingsStore(state => state.setLanguage);
 
   useEffect(() => {
-    setCurrentLang(language, language === 'en' ? enJSON : zhJSON);
+    setCurrentLang(language, getLocaleMessages(language));
   }, [language, setCurrentLang]);
 
   const handleLanguageChange = useCallback((value: string) => {
     setLanguageInStore(value);
-    setCurrentLang(value, value === 'en' ? enJSON : zhJSON);
+    setCurrentLang(value, getLocaleMessages(value));
   }, [setLanguageInStore, setCurrentLang]);
 
   return {

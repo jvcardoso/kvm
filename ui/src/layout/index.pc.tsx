@@ -1,3 +1,4 @@
+import { useWebRTCDisk } from "@/hooks/useWebRTCDisk";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Outlet,
@@ -19,7 +20,6 @@ import {
   UpdateState,
   useDeviceStore,
   useHidStore,
-  useMountMediaStore,
   useNetworkStateStore,
   User,
   useRTCStore,
@@ -55,8 +55,7 @@ import { BarsHotZones, useBarsAutoHide } from "@/layout/core/bar_autohide";
 import { useTheme } from "@/layout/contexts/ThemeContext";
 
 
-import enJSON from '../locales/en.json';
-import zhJSON from '../locales/zh.json';
+import { getLocaleMessages } from '../locales';
 interface LocalLoaderResp {
   authMode: "password" | "noPassword" | null;
 }
@@ -862,7 +861,7 @@ export default function PCHome() {
   useEffect(() => {
     updateVpnStates();
   }, [updateVpnStates]);
-  useInterval(updateVpnStates, 5000);
+  useInterval(updateVpnStates, 15000);
 
   const updateUsbState = useCallback(() => {
     send("getUSBState", {}, resp => {
@@ -952,25 +951,7 @@ export default function PCHome() {
     };
   }, [rpcDataChannel, forceHttp, keyboardLedSync, send, setKeyboardLedState, setKeyboardLedStateSyncAvailable]);
 
-  const diskChannel = useRTCStore(state => state.diskChannel)!;
-  const file = useMountMediaStore(state => state.localFile)!;
-  useEffect(() => {
-    if (!diskChannel || !file) return;
-    diskChannel.onmessage = async e => {
-      console.log("Received", e.data);
-      const data = JSON.parse(e.data);
-      const blob = file.slice(data.start, data.end);
-      const buf = await blob.arrayBuffer();
-      const header = new ArrayBuffer(16);
-      const headerView = new DataView(header);
-      headerView.setBigUint64(0, BigInt(data.start), false); // start offset, big-endian
-      headerView.setBigUint64(8, BigInt(buf.byteLength), false); // length, big-endian
-      const fullData = new Uint8Array(header.byteLength + buf.byteLength);
-      fullData.set(new Uint8Array(header), 0);
-      fullData.set(new Uint8Array(buf), header.byteLength);
-      diskChannel.send(fullData);
-    };
-  }, [diskChannel, file]);
+  useWebRTCDisk();
 
   // System update
   const disableKeyboardFocusTrap = useUiStore(state => state.disableVideoFocusTrap);
@@ -1058,7 +1039,7 @@ export default function PCHome() {
   const { setCurrentLang } = useReactAt();
   // Initialize Language
   useEffect(() => {
-    setCurrentLang(language, language === 'en' ? enJSON : zhJSON);
+    setCurrentLang(language, getLocaleMessages(language));
   }, [language, setCurrentLang]);
 
   return (

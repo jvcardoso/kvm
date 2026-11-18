@@ -10,3 +10,16 @@ ui/.i18n_extractor.json
 
 device-tests.tar.gz
 .worktrees/
+
+# AI / analysis artifacts and local notes
+.agent/
+.claude/
+.codex/
+.cursor/
+.gemini/
+AGENTS.md
+CLAUDE.md
+REVISAO_*.md
+REVALIDACAO_*.md
+VALIDACAO_*.md
+MELHORIAS_*.md

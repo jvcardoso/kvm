@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState, useRef } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useResizeObserver } from "usehooks-ts";
 import JMuxer from "jmuxer";
+import { useReactAt } from "i18n-auto-extractor/react";
+import notifications from "@/notifications";
 
 import { useRTCStore, useVideoStore, useSettingsStore } from "@/hooks/stores";
 
@@ -14,7 +16,8 @@ export const useVideoStream = (
   const setPeerConnectionState = useRTCStore(state => state.setPeerConnectionState);
   const forceHttp = useSettingsStore(state => state.forceHttp);
   const { setClientSize: setVideoClientSize, setSize: setVideoSize } = useVideoStore();
-  const jmuxerRef = useRef<any>(null);
+  const { $at } = useReactAt();
+  const unsupportedHevc = $at("This browser cannot play H.265. Select H.264 in Video settings.");
 
   const updateVideoSizeStore = useCallback((videoElm: HTMLVideoElement) => {
     setVideoClientSize(videoElm.clientWidth, videoElm.clientHeight);
@@ -98,181 +101,90 @@ export const useVideoStream = (
   }, [mediaStream, addStreamToVideoElm, addStreamToAudioElm, forceHttp, videoElm, audioElm]);
 
   useEffect(() => {
-    if (forceHttp && videoElm.current) {
-      console.log('[forceHttp] Setting up HTTP video stream');
+    const video = videoElm.current;
+    if (!forceHttp || !video) return;
 
-      if (jmuxerRef.current) {
-        console.log('[forceHttp] Destroying previous JMuxer instance');
-        jmuxerRef.current.destroy();
-        jmuxerRef.current = null;
-      }
+    const controller = new AbortController();
+    let watchdog: ReturnType<typeof setTimeout>;
+    const fail = () => {
+      setIsPlaying(false);
+      setPeerConnectionState("failed");
+      controller.abort();
+    };
+    const restartWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(fail, 10_000);
+    };
 
-      if (videoElm.current.srcObject) {
-        console.log('[forceHttp] Clearing video srcObject');
-        videoElm.current.srcObject = null;
-      }
-      if (audioElm.current?.srcObject) {
-        console.log('[forceHttp] Clearing audio srcObject');
-        audioElm.current.srcObject = null;
-      }
+    const fetchStream = async () => {
+      while (!controller.signal.aborted) {
+        setIsPlaying(false);
+        setPeerConnectionState("connecting");
+        restartWatchdog();
+        const response = await fetch("/video/stream", { signal: controller.signal });
+        if (!response.ok || !response.body) {
+          throw new Error(`HTTP video stream returned ${response.status}`);
+        }
+        if (controller.signal.aborted) return;
 
-      console.log('[forceHttp] Creating new JMuxer instance');
-      jmuxerRef.current = new JMuxer({
-        node: videoElm.current,
-        mode: 'video',
-        flushingTime: 0,
-        fps: 60,
-        debug: false
-      });
-      console.log('[forceHttp] JMuxer instance created:', jmuxerRef.current);
+        const codec = response.headers.get("X-Video-Codec");
+        const isHEVC = codec === "h265" || (!codec && response.headers.get("Content-Type") === "video/x-h265");
+        const fps = Number(response.headers.get("X-Video-FPS"));
+        // JMuxer 2.1 supports these options at runtime, but its type package omits them.
+        const options: ConstructorParameters<typeof JMuxer>[0] & {
+          videoCodec: "H264" | "H265";
+          onUnsupportedCodec: () => void;
+        } = {
+          node: video,
+          mode: "video",
+          videoCodec: isHEVC ? "H265" : "H264",
+          flushingTime: 10,
+          fps: fps > 0 && Number.isFinite(fps) ? fps : 60,
+          onUnsupportedCodec: () => {
+            if (controller.signal.aborted) return;
+            if (isHEVC) notifications.error(unsupportedHevc);
+            fail();
+          },
+        };
+        const muxer = new JMuxer(options);
 
-      markAsPlaying();
-      setPeerConnectionState("connecting");
-
-      const controller = new AbortController();
-      const signal = controller.signal;
-      const hasReceivedDataRef = { current: false };
-      const lastDataAtRef = { current: Date.now() };
-      const watchdogInterval = setInterval(() => {
-        if (!hasReceivedDataRef.current) return;
-        const msSinceLastData = Date.now() - lastDataAtRef.current;
-        if (msSinceLastData <= 10000) return;
-        console.error('[forceHttp] Stream watchdog triggered (no data for 10 seconds)');
-        setPeerConnectionState("failed");
-        controller.abort();
-      }, 1000);
-
-      const fetchStream = async () => {
+        const reader = response.body.getReader();
+        let receivedData = false;
         try {
-          console.log('[forceHttp] Starting fetch to /video/stream');
-          
-          console.log('[forceHttp] Creating fetch promise with timeout');
-          const fetchPromise = fetch('/video/stream', { signal }).catch(err => {
-            console.error('[forceHttp] Fetch promise rejected:', err);
-            throw err;
-          });
-          
-          const timeoutPromise = new Promise<never>((_, reject) => {
-            setTimeout(() => {
-              reject(new Error('Fetch timeout after 5 seconds'));
-            }, 5000);
-          });
-          
-          console.log('[forceHttp] Racing fetch and timeout promises');
-          let response: Response;
-          try {
-            response = await Promise.race([fetchPromise, timeoutPromise]) as Response;
-            console.log('[forceHttp] Promise race completed, got response');
-          } catch (err: any) {
-            console.error('[forceHttp] Promise race failed:', {
-              name: err?.name,
-              message: err?.message,
-              stack: err?.stack
-            });
-            throw err;
-          }
-          
-          console.log('[forceHttp] Response received:', response.status, response.statusText, {
-            ok: response.ok,
-            headers: Object.fromEntries(response.headers.entries()),
-            bodyUsed: response.bodyUsed,
-            body: response.body ? 'present' : 'null'
-          });
-          
-          if (!response.ok) {
-            console.error('[forceHttp] Response not OK:', response.status, response.statusText);
-            const text = await response.text();
-            console.error('[forceHttp] Response body:', text);
-            setPeerConnectionState("failed");
-            return;
-          }
-
-          const reader = response.body?.getReader();
-          if (!reader) {
-            console.error('[forceHttp] No reader available from response body');
-            setPeerConnectionState("failed");
-            return;
-          }
-
-          console.log('[forceHttp] Reader obtained, starting to read frames');
-
-          let frameCount = 0;
-          const startTime = Date.now();
-          let lastFrameTime = Date.now();
-          let lastDataTime = Date.now();
-
-          while (true) {
-            try {
-              const now = Date.now();
-              if (frameCount > 0 && now - lastDataTime > 10000) {
-                console.error('[forceHttp] No data received for 10 seconds. Last frame was', frameCount, 'time since last data:', now - lastDataTime, 'ms');
-                lastDataTime = now;
-              }
-
-              const { done, value } = await reader.read();
-
-              if (done) {
-                console.log('[forceHttp] Stream ended, total frames:', frameCount, 'duration:', Date.now() - startTime, 'ms');
-                setPeerConnectionState("failed");
-                break;
-              }
-
-              if (value) {
-                lastDataTime = Date.now();
-                lastDataAtRef.current = lastDataTime;
-                const timeSinceLastFrame = lastDataTime - lastFrameTime;
-                lastFrameTime = lastDataTime;
-
-                frameCount++;
-                if (frameCount === 1) {
-                  hasReceivedDataRef.current = true;
-                  console.log('[forceHttp] First frame received, size:', value.length, 'time since start:', lastDataTime - startTime, 'ms');
-                  setPeerConnectionState("connected");
-                }
-                //if (frameCount % 60 === 0) {
-                //  console.log('[forceHttp] Received frames:', frameCount, 'latest size:', value.length, 'elapsed:', lastDataTime - startTime, 'ms', 'time since last frame:', timeSinceLastFrame, 'ms');
-                //}
-                if (jmuxerRef.current) {
-                  jmuxerRef.current.feed({
-                    video: value
-                  });
-                } else {
-                  console.warn('[forceHttp] JMuxer not available when trying to feed frame', frameCount);
-                }
-              }
-            } catch (readError: any) {
-              console.error('[forceHttp] Error reading from stream:', readError);
-              setPeerConnectionState("failed");
-              break;
+          while (!controller.signal.aborted) {
+            const { done, value } = await reader.read();
+            if (done || controller.signal.aborted) break;
+            if (value.length === 0) continue;
+            restartWatchdog();
+            if (!receivedData) {
+              receivedData = true;
+              setPeerConnectionState("connected");
             }
+            muxer.feed({ video: value });
           }
-        } catch (error: any) {
-          if (error.name !== 'AbortError') {
-            console.error('[forceHttp] Error fetching video stream:', {
-              name: error.name,
-              message: error.message,
-              stack: error.stack,
-              cause: error.cause
-            });
-            setPeerConnectionState("failed");
-          } else {
-            console.log('[forceHttp] Fetch aborted (normal cleanup)');
-          }
+        } finally {
+          reader.releaseLock();
+          muxer.destroy();
         }
-      };
-
-      fetchStream();
-
-      return () => {
-        clearInterval(watchdogInterval);
-        controller.abort();
-        if (jmuxerRef.current) {
-          jmuxerRef.current.destroy();
-          jmuxerRef.current = null;
+        // The server ends the current response when the device changes codec.
+        // Fetch fresh headers and create a muxer for the new response.
+        if (!receivedData && !controller.signal.aborted) {
+          throw new Error("HTTP video stream closed before sending data");
         }
-      };
-    }
-  }, [forceHttp, videoElm, audioElm, markAsPlaying, setPeerConnectionState]);
+      }
+    };
+
+    void fetchStream().catch(error => {
+      if (controller.signal.aborted) return;
+      console.error("HTTP video stream failed", error);
+      fail();
+    }).finally(() => clearTimeout(watchdog));
+
+    return () => {
+      clearTimeout(watchdog);
+      controller.abort();
+    };
+  }, [forceHttp, videoElm, setPeerConnectionState, unsupportedHevc]);
 
   return {
     isPlaying,
