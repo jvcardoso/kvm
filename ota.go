@@ -104,6 +104,14 @@ type UpdateStatus struct {
 }
 
 var UpdateGithubAppReleaseUrls = []string{
+	"https://api.github.com/repos/jvcardoso/kvm/releases/latest",
+	"https://api.github.com/repos/LuckfoxTECH/kvm/releases/latest",
+	"https://api.github.com/repos/LuckfoxTECH/kvm_app/releases/latest",
+	"https://api.github.com/repos/luckfox-eng29/kvm/releases/latest",
+	"https://api.github.com/repos/luckfox-eng29/kvm_app/releases/latest",
+}
+
+var UpdateGithubUpstreamAppReleaseUrls = []string{
 	"https://api.github.com/repos/LuckfoxTECH/kvm/releases/latest",
 	"https://api.github.com/repos/LuckfoxTECH/kvm_app/releases/latest",
 	"https://api.github.com/repos/luckfox-eng29/kvm/releases/latest",
@@ -118,6 +126,7 @@ var UpdateGiteeAppReleaseUrls = []string{
 }
 
 var UpdateGithubSystemReleaseUrls = []string{
+	"https://api.github.com/repos/jvcardoso/kvm_system/releases/latest",
 	"https://api.github.com/repos/LuckfoxTECH/kvm_system/releases/latest",
 	"https://api.github.com/repos/luckfox-eng29/kvm_system/releases/latest",
 }
@@ -134,7 +143,7 @@ var UpdateGiteeSystemZipUrls = []string{
 
 const cdnUpdateBaseURL = "https://cdn.picokvm.top/luckfox_picokvm_firmware/lastest/"
 
-var builtAppVersion = "0.1.4+dev"
+var builtAppVersion = "0.1.6"
 
 var (
 	updateSource        = "github"
@@ -142,12 +151,13 @@ var (
 )
 
 const (
-	updateSourceGithub = "github"
-	updateSourceGitee  = "gitee"
-	updateSourceCDN    = "cdn"
-	updateSourceCustom = "custom"
-	updateSourceLocal  = "local"
-	localPackageDir    = "/userdata/picokvm/ota_local_pkg"
+	updateSourceGithub         = "github"
+	updateSourceGithubUpstream = "github_upstream"
+	updateSourceGitee          = "gitee"
+	updateSourceCDN            = "cdn"
+	updateSourceCustom         = "custom"
+	updateSourceLocal          = "local"
+	localPackageDir            = "/userdata/picokvm/ota_local_pkg"
 )
 
 // otaUploadMutex prevents concurrent uploads and updates
@@ -155,7 +165,7 @@ var otaUploadMutex sync.Mutex
 
 func rpcSetUpdateSource(source string) error {
 	switch source {
-	case updateSourceGithub, updateSourceGitee, updateSourceCDN, updateSourceCustom, updateSourceLocal:
+	case updateSourceGithub, updateSourceGithubUpstream, updateSourceGitee, updateSourceCDN, updateSourceCustom, updateSourceLocal:
 	default:
 		return fmt.Errorf("invalid update source: %s", source)
 	}
@@ -221,7 +231,9 @@ func fetchUpdateMetadata(ctx context.Context, deviceId string) (*RemoteMetadata,
 func fetchKvmAppLatestRelease(ctx context.Context) (tag string, downloadURL string, sha256 string, sigURL string, err error) {
 	apiURLs := UpdateGithubAppReleaseUrls
 	fallbackToGithub := false
-	if updateSource == updateSourceGitee {
+	if updateSource == updateSourceGithubUpstream {
+		apiURLs = UpdateGithubUpstreamAppReleaseUrls
+	} else if updateSource == updateSourceGitee {
 		apiURLs = UpdateGiteeAppReleaseUrls
 		fallbackToGithub = true
 	}

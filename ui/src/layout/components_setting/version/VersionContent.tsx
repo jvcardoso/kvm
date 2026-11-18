@@ -342,6 +342,38 @@ export default function SettingsVersion() {
             </AntdButton>
           </div>
 
+          <SettingsItem
+            title={$at("Credits & Repositories")}
+            description={
+              <span className="block space-y-1 text-xs leading-relaxed">
+                <span className="block">
+                  <strong>{$at("Custom Build & Maintainer")}:</strong> Juliano V. Cardoso (
+                  <a
+                    href="https://github.com/jvcardoso/kvm"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-600 underline hover:text-blue-500 dark:text-blue-400"
+                  >
+                    github.com/jvcardoso/kvm
+                  </a>
+                  )
+                </span>
+                <span className="block">
+                  <strong>{$at("Original Base Project")}:</strong> Luckfox PicoKVM (
+                  <a
+                    href="https://github.com/LuckfoxTECH/kvm"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-600 underline hover:text-blue-500 dark:text-blue-400"
+                  >
+                    github.com/LuckfoxTECH/kvm
+                  </a>
+                  ) • JetKVM
+                </span>
+              </span>
+            }
+          />
+
           {signatureStatusChecked && (
             <SignatureStatusCard
               signatureStatus={signatureStatus}
@@ -699,7 +731,8 @@ function LocalPackageUploadStatus({
 
 const updateSourceOptions = [
   //{ value: "cdn", label: "CDN" },
-  { value: "github", label: "github" },
+  { value: "github", label: "github (jvcardoso)" },
+  { value: "github_upstream", label: "github (LuckfoxTECH)" },
   //{ value: "gitee", label: "gitee" },
   { value: "custom", label: "custom" },
   { value: "local", label: "local" },
@@ -727,7 +760,7 @@ function UpdateSourceSettings({
       >
         <Select
           value={updateSource}
-          className={`${isMobile?"w-full":"h-[36px] w-[22%]"}`}
+          className={`${isMobile ? "w-full" : "h-[36px] min-w-[210px] w-auto"}`}
           options={updateSourceOptions.map(opt => ({
             ...opt,
             label: $at(opt.label),
